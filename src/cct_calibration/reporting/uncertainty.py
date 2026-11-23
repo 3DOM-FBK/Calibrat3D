@@ -11,8 +11,11 @@ from cct_calibration.run import project_point
 from cct_calibration.reporting.records import CameraInfo, ReportData
 
 
-INTRINSIC_NAMES = ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2")
 POSE_NAMES = ("rx", "ry", "rz", "tx", "ty", "tz")
+
+
+def _camera_info(data: ReportData, name: str) -> CameraInfo:
+    return next(camera for camera in data.cameras if camera.name == name)
 
 
 def _covariance_submatrix(adjustment, indices: list[int] | np.ndarray) -> np.ndarray | None:
@@ -40,16 +43,8 @@ def _matrix(intrinsics: np.ndarray) -> np.ndarray:
     ])
 
 
-def _forward_intrinsics(intrinsics: np.ndarray, normalized_point: np.ndarray) -> np.ndarray:
-    x, y = normalized_point
-    radius_sq = x * x + y * y
-    radial = 1.0 + intrinsics[4] * radius_sq + intrinsics[5] * radius_sq ** 2
-    xt = 2.0 * intrinsics[6] * x * y + intrinsics[7] * (radius_sq + 2.0 * x * x)
-    yt = intrinsics[6] * (radius_sq + 2.0 * y * y) + 2.0 * intrinsics[7] * x * y
-    return np.array([
-        intrinsics[0] * (x * radial + xt) + intrinsics[2],
-        intrinsics[1] * (y * radial + yt) + intrinsics[3],
-    ])
+def _forward_intrinsics(camera: CameraInfo, intrinsics: np.ndarray, ray: np.ndarray) -> np.ndarray:
+    return camera.model.project(intrinsics, ray)[0]
 
 
 def _step(value: float) -> float:
@@ -71,7 +66,7 @@ def projection_uncertainty_grid(
     if adjustment is None or adjustment.covariance.size == 0:
         return None
     name_to_index = {name: i for i, name in enumerate(adjustment.parameter_names)}
-    indices = [name_to_index.get(f"{camera.name}.{name}") for name in INTRINSIC_NAMES]
+    indices = [name_to_index.get(f"{camera.name}.{name}") for name in camera.model.param_names]
     if any(index is None for index in indices):
         return None
     indices = np.asarray(indices, dtype=int)
@@ -82,23 +77,23 @@ def projection_uncertainty_grid(
     xs = np.linspace(0.0, camera.width - 1.0, columns)
     ys = np.linspace(0.0, camera.height - 1.0, rows)
     grid = np.zeros((rows, columns), dtype=np.float64)
-    camera_matrix = _matrix(camera.intrinsics)
+    count = camera.model.num_params
     for row, v in enumerate(ys):
         for col, u in enumerate(xs):
-            normalized = cv2.undistortPoints(
-                np.array([u, v], dtype=np.float64).reshape(1, 1, 2),
-                camera_matrix, camera.intrinsics[4:8],
-            )[0, 0]
-            jacobian = np.zeros((2, 8), dtype=np.float64)
-            for parameter in range(8):
+            ray = camera.model.bearings(camera.intrinsics, np.array([[u, v]], dtype=np.float64))[0]
+            if not np.all(np.isfinite(ray)):
+                grid[row, col] = np.nan
+                continue
+            jacobian = np.zeros((2, count), dtype=np.float64)
+            for parameter in range(count):
                 step = _step(camera.intrinsics[parameter])
                 plus = camera.intrinsics.copy()
                 minus = camera.intrinsics.copy()
                 plus[parameter] += step
                 minus[parameter] -= step
                 jacobian[:, parameter] = (
-                    _forward_intrinsics(plus, normalized)
-                    - _forward_intrinsics(minus, normalized)
+                    _forward_intrinsics(camera, plus, ray)
+                    - _forward_intrinsics(camera, minus, ray)
                 ) / (2.0 * step)
             output_covariance = jacobian @ covariance @ jacobian.T
             grid[row, col] = np.sqrt(max(float(np.trace(output_covariance)), 0.0))
@@ -112,20 +107,21 @@ def _parameter_vector(data: ReportData) -> tuple[np.ndarray, dict[str, int]]:
     }
 
 
-def _intrinsics_from(vector: np.ndarray, lookup: dict[str, int], camera: str) -> np.ndarray:
-    return np.array([vector[lookup[f"{camera}.{name}"]] for name in INTRINSIC_NAMES])
+def _intrinsics_from(vector: np.ndarray, lookup: dict[str, int], camera: CameraInfo) -> np.ndarray:
+    return np.array([vector[lookup[f"{camera.name}.{name}"]] for name in camera.model.param_names])
 
 
 def _pose_from(vector: np.ndarray, lookup: dict[str, int], camera: str) -> np.ndarray:
     return np.array([vector[lookup[f"{camera}.{name}"]] for name in POSE_NAMES])
 
 
-def _projected_in_sensor(intrinsics: np.ndarray, pose: np.ndarray, point: np.ndarray, width: int, height: int) -> bool:
+def _projected_in_sensor(camera: CameraInfo, intrinsics: np.ndarray, pose: np.ndarray, point: np.ndarray) -> bool:
+    width, height = camera.width, camera.height
     rotation = cv2.Rodrigues(pose[:3])[0]
     camera_point = rotation @ point + pose[3:]
-    if not np.all(np.isfinite(camera_point)) or float(camera_point[2]) <= 0:
+    if not np.all(np.isfinite(camera_point)) or not bool(camera.model.is_projectable(camera_point)):
         return False
-    projected = project_point(intrinsics, pose, point)
+    projected = project_point(intrinsics, pose, point, camera.model)
     return bool(
         np.all(np.isfinite(projected))
         and -0.5 <= float(projected[0]) < width - 0.5
@@ -143,7 +139,7 @@ def projection_uncertainty_vs_distance(
         return None
     vector, lookup = _parameter_vector(data)
     covariance = np.asarray(data.adjustment.covariance, dtype=np.float64)
-    relevant_names = [f"{camera.name}.{name}" for name in INTRINSIC_NAMES]
+    relevant_names = [f"{camera.name}.{name}" for name in camera.model.param_names]
     if camera.name != data.cameras[0].name:
         relevant_names += [f"{camera.name}.{name}" for name in POSE_NAMES]
     relevant = [lookup[name] for name in relevant_names if name in lookup]
@@ -158,14 +154,13 @@ def projection_uncertainty_vs_distance(
         point = np.array([0.0, 0.0, float(distance)])
 
         def evaluate(values: np.ndarray) -> np.ndarray:
-            intrinsics = _intrinsics_from(values, lookup, camera.name)
+            intrinsics = _intrinsics_from(values, lookup, camera)
             pose = _pose_from(values, lookup, camera.name)
-            return project_point(intrinsics, pose, point)
+            return project_point(intrinsics, pose, point, camera.model)
 
         if not _projected_in_sensor(
-            _intrinsics_from(vector, lookup, camera.name),
+            camera, _intrinsics_from(vector, lookup, camera),
             _pose_from(vector, lookup, camera.name), point,
-            camera.width, camera.height,
         ):
             output[distance_index] = np.nan
             continue
@@ -183,18 +178,18 @@ def projection_uncertainty_vs_distance(
 
 
 def _triangulate(
+    camera_a: CameraInfo,
+    camera_b: CameraInfo,
     intrinsics_a: np.ndarray,
     intrinsics_b: np.ndarray,
     pose_b: np.ndarray,
     point_a_px: np.ndarray,
     point_b_px: np.ndarray,
 ) -> np.ndarray | None:
-    normalized_a = cv2.undistortPoints(
-        point_a_px.reshape(1, 1, 2), _matrix(intrinsics_a), intrinsics_a[4:8],
-    )[0, 0]
-    normalized_b = cv2.undistortPoints(
-        point_b_px.reshape(1, 1, 2), _matrix(intrinsics_b), intrinsics_b[4:8],
-    )[0, 0]
+    normalized_a = camera_a.model.normalize(intrinsics_a, point_a_px.reshape(1, 2))[0]
+    normalized_b = camera_b.model.normalize(intrinsics_b, point_b_px.reshape(1, 2))[0]
+    if not (np.all(np.isfinite(normalized_a)) and np.all(np.isfinite(normalized_b))):
+        return None
     rotation_b = cv2.Rodrigues(pose_b[:3])[0]
     projection_a = np.hstack([np.eye(3), np.zeros((3, 1))])
     projection_b = np.hstack([rotation_b, pose_b[3:].reshape(3, 1)])
@@ -230,8 +225,8 @@ def triangulation_uncertainty_vs_distance(
     vector, lookup = _parameter_vector(data)
     covariance = np.asarray(data.adjustment.covariance, dtype=np.float64)
     relevant_names = (
-        [f"{camera_a.name}.{name}" for name in INTRINSIC_NAMES]
-        + [f"{camera_b.name}.{name}" for name in INTRINSIC_NAMES]
+        [f"{camera_a.name}.{name}" for name in camera_a.model.param_names]
+        + [f"{camera_b.name}.{name}" for name in camera_b.model.param_names]
         + [f"{camera_b.name}.{name}" for name in POSE_NAMES]
     )
     relevant = [lookup[name] for name in relevant_names if name in lookup]
@@ -248,14 +243,14 @@ def triangulation_uncertainty_vs_distance(
     sx, sy, sz = [], [], []
     for distance in distances:
         true_point = np.array([0.0, 0.0, float(distance)])
-        intrinsics_a = _intrinsics_from(vector, lookup, camera_a.name)
-        intrinsics_b = _intrinsics_from(vector, lookup, camera_b.name)
+        intrinsics_a = _intrinsics_from(vector, lookup, camera_a)
+        intrinsics_b = _intrinsics_from(vector, lookup, camera_b)
         pose_b = _pose_from(vector, lookup, camera_b.name)
-        point_a = project_point(intrinsics_a, np.zeros(6), true_point)
-        point_b = project_point(intrinsics_b, pose_b, true_point)
+        point_a = project_point(intrinsics_a, np.zeros(6), true_point, camera_a.model)
+        point_b = project_point(intrinsics_b, pose_b, true_point, camera_b.model)
         if not (
-            _projected_in_sensor(intrinsics_a, np.zeros(6), true_point, camera_a.width, camera_a.height)
-            and _projected_in_sensor(intrinsics_b, pose_b, true_point, camera_b.width, camera_b.height)
+            _projected_in_sensor(camera_a, intrinsics_a, np.zeros(6), true_point)
+            and _projected_in_sensor(camera_b, intrinsics_b, pose_b, true_point)
         ):
             sx.append(np.nan)
             sy.append(np.nan)
@@ -269,8 +264,8 @@ def triangulation_uncertainty_vs_distance(
             plus, minus = measured.copy(), measured.copy()
             plus[column] += step
             minus[column] -= step
-            xp = _triangulate(intrinsics_a, intrinsics_b, pose_b, plus[:2], plus[2:])
-            xm = _triangulate(intrinsics_a, intrinsics_b, pose_b, minus[:2], minus[2:])
+            xp = _triangulate(camera_a, camera_b, intrinsics_a, intrinsics_b, pose_b, plus[:2], plus[2:])
+            xm = _triangulate(camera_a, camera_b, intrinsics_a, intrinsics_b, pose_b, minus[:2], minus[2:])
             if xp is None or xm is None:
                 return None
             jacobian_observation[:, column] = (xp - xm) / (2.0 * step)
@@ -282,13 +277,15 @@ def triangulation_uncertainty_vs_distance(
             plus[parameter] += step
             minus[parameter] -= step
             xp = _triangulate(
-                _intrinsics_from(plus, lookup, camera_a.name),
-                _intrinsics_from(plus, lookup, camera_b.name),
+                camera_a, camera_b,
+                _intrinsics_from(plus, lookup, camera_a),
+                _intrinsics_from(plus, lookup, camera_b),
                 _pose_from(plus, lookup, camera_b.name), point_a, point_b,
             )
             xm = _triangulate(
-                _intrinsics_from(minus, lookup, camera_a.name),
-                _intrinsics_from(minus, lookup, camera_b.name),
+                camera_a, camera_b,
+                _intrinsics_from(minus, lookup, camera_a),
+                _intrinsics_from(minus, lookup, camera_b),
                 _pose_from(minus, lookup, camera_b.name), point_a, point_b,
             )
             if xp is None or xm is None:

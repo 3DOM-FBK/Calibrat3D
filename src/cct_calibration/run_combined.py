@@ -58,6 +58,12 @@ from cct_calibration.run import (
 )
 from cct_detect.refinement import prepare_refinement_image, refine_projected_center
 from cct_calibration.run import _detector_for, _init_detection_worker
+from cct_calibration.camera_models import (
+    DEFAULT_CAMERA_MODEL,
+    CameraModel,
+    add_camera_model_arguments,
+    camera_model_from_args,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -113,7 +119,9 @@ def parse_known_baseline_argument(raw: object) -> tuple[float | None, np.ndarray
 class MultiCameraState:
     """State for joint multi-camera calibration.
 
-    Each camera has its own intrinsics vector (8-element OPENCV model).
+    Each camera has its own intrinsics vector ``[fx, fy, cx, cy, *coefficients]``
+    whose layout is given by its :class:`CameraModel` (``camera_models``;
+    cameras without an entry use the historical OPENCV k1 k2 p1 p2 model).
     ``rig_poses`` stores the 6-DOF pose (Rodrigues + translation) of camera-0
     for each rig frame.  The pose of camera *k* in rig frame *f* is computed as:
 
@@ -121,11 +129,15 @@ class MultiCameraState:
 
     ``relative_poses[0]`` is always the identity (cam-0 is the reference).
     """
-    camera_intrinsics: Dict[str, np.ndarray]          # cam_name -> [fx,fy,cx,cy,k1,k2,p1,p2]
+    camera_intrinsics: Dict[str, np.ndarray]          # cam_name -> [fx,fy,cx,cy,*coefficients]
     rig_poses: Dict[str, np.ndarray]                   # frame_id (timestamp) -> 6-vector (cam-0 pose)
     relative_poses: Dict[str, np.ndarray]              # cam_name -> 6-vector relative to cam-0
     points: Dict[int, np.ndarray]                      # target_id -> 3D point
     camera_names: List[str]                            # ordered camera names
+    camera_models: Dict[str, CameraModel] = field(default_factory=dict)
+
+    def model(self, cam_name: str) -> CameraModel:
+        return self.camera_models.get(cam_name, DEFAULT_CAMERA_MODEL)
 
 
 @dataclass
@@ -260,12 +272,17 @@ def run_sfm(
     initial_focal: float | None = None,
     known_baseline: float | None = None,
     force: bool = False,
+    camera_models: Dict[str, CameraModel] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, np.ndarray]]]:
     """Run pycolmap SfM and return per-camera intrinsics and per-image poses.
 
+    SfM uses COLMAP's base model of each camera's family (OPENCV for pinhole
+    cameras, OPENCV_FISHEYE for fisheye cameras); the result is converted to
+    the requested model, additional coefficients starting at zero.
+
     Returns
     -------
-    intrinsics_by_camera : dict  cam_name -> 8-vector [fx,fy,cx,cy,k1,k2,p1,p2]
+    intrinsics_by_camera : dict  cam_name -> intrinsics in the camera's model
     poses_by_camera : dict  cam_name -> { image_stem: 6-vector pose }
     """
     db_path = sfm_output_dir / "sfm.db"
@@ -285,16 +302,30 @@ def run_sfm(
     if initial_focal is None:
         initial_focal = max(img_w, img_h) * 0.5
 
+    camera_models = camera_models or {}
+    sfm_model_names = {
+        cam_name: "OPENCV_FISHEYE" if camera_models.get(cam_name, DEFAULT_CAMERA_MODEL).is_fisheye else "OPENCV"
+        for cam_name in camera_names
+    }
+
     # Check for cached reconstruction
     images_txt = recon_output / "images.txt"
     cameras_txt = recon_output / "cameras.txt"
     use_cache = (not force) and images_txt.exists() and cameras_txt.exists()
-
+    reconstruction = None
     if use_cache:
         print("  reloading existing SfM reconstruction...", flush=True)
         reconstruction = pycolmap.Reconstruction()
         reconstruction.read_text(str(recon_output))
-    else:
+        cached_models = {
+            cam_name: reconstruction.cameras[camera_id_map[cam_name]].model.name
+            for cam_name in camera_names if camera_id_map[cam_name] in reconstruction.cameras
+        }
+        if cached_models != sfm_model_names:
+            print(f"  cached SfM camera models {cached_models} differ from {sfm_model_names}; re-running SfM",
+                  flush=True)
+            use_cache = False
+    if not use_cache:
         # Copy images into COLMAP directory structure
         rig_dir = colmap_image_root / "rig1"
         for cam_name in camera_names:
@@ -319,7 +350,7 @@ def run_sfm(
         # Create cameras
         for cam_name in camera_names:
             cam_config = {
-                "model": "OPENCV",
+                "model": sfm_model_names[cam_name],
                 "width": img_w,
                 "height": img_h,
                 "params": [initial_focal, initial_focal, img_w / 2.0, img_h / 2.0,
@@ -461,7 +492,8 @@ def run_sfm(
         cam_id = camera_id_map[cam_name]
         colmap_cam = reconstruction.cameras[cam_id]
         params = np.array(colmap_cam.params, dtype=np.float64)
-        intrinsics_by_camera[cam_name] = params
+        model = camera_models.get(cam_name, DEFAULT_CAMERA_MODEL)
+        intrinsics_by_camera[cam_name] = model.intrinsics_from_colmap(colmap_cam.model.name, params)
 
     # Extract per-image poses
     poses_by_camera: Dict[str, Dict[str, np.ndarray]] = {cn: {} for cn in camera_names}
@@ -725,6 +757,7 @@ def _recover_verified_ellipse(
 
 def _cached_model_is_current(
     images: Sequence[ImageDetections], current: np.ndarray,
+    camera_model: CameraModel = DEFAULT_CAMERA_MODEL,
 ) -> tuple[bool, float, float]:
     old_models: list[np.ndarray] = []
     sample_points: list[np.ndarray] = []
@@ -742,8 +775,11 @@ def _cached_model_is_current(
             values = status.get("intrinsics")
             if values is None:
                 return False, float("inf"), float("inf")
+            # Entries written before camera models were selectable used OPENCV-8.
+            if status.get("camera_model", DEFAULT_CAMERA_MODEL.key) != camera_model.key:
+                return False, float("inf"), float("inf")
             model = np.asarray(values, dtype=np.float64)
-            if model.shape != (8,) or not np.all(np.isfinite(model)):
+            if model.shape != (camera_model.num_params,) or not np.all(np.isfinite(model)):
                 return False, float("inf"), float("inf")
             old_models.append(model)
             sample_points.append(np.asarray(point, dtype=np.float64))
@@ -752,13 +788,9 @@ def _cached_model_is_current(
     old = old_models[0]
     if any(not np.allclose(model, old, rtol=0.0, atol=1e-12) for model in old_models[1:]):
         return False, float("inf"), float("inf")
-    points = np.asarray(sample_points, dtype=np.float64).reshape(-1, 1, 2)
-    old_rays = cv2.undistortPoints(
-        points, intrinsics_matrix(old), distortion_vector(old),
-    ).reshape(-1, 2)
-    new_rays = cv2.undistortPoints(
-        points, intrinsics_matrix(current), distortion_vector(current),
-    ).reshape(-1, 2)
+    points = np.asarray(sample_points, dtype=np.float64).reshape(-1, 2)
+    old_rays = camera_model.normalize(old, points)
+    new_rays = camera_model.normalize(current, points)
     pixel_scale = np.array([current[0], current[1]], dtype=np.float64)
     shifts = np.linalg.norm((new_rays - old_rays) * pixel_scale, axis=1)
     shifts = shifts[np.isfinite(shifts)]
@@ -774,6 +806,7 @@ def _refine_image_centres(
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
     codebook: Set[int] | None,
+    camera_model: CameraModel = DEFAULT_CAMERA_MODEL,
 ):
     """Calibrated centre refinement of one image (process-safe).
 
@@ -809,6 +842,7 @@ def _refine_image_centres(
             image_record.refinement_status[target_id] = {
                 "method": "unchanged",
                 "intrinsics": [float(value) for value in intrinsics],
+                "camera_model": camera_model.key,
                 "reason": "verified ellipse unavailable after bounded local recovery",
                 "recovery_exhausted": True,
             }
@@ -820,7 +854,7 @@ def _refine_image_centres(
         if prepared_gray is None:
             prepared_gray = prepare_refinement_image(raw_gray)
         estimate = refine_projected_center(
-            prepared_gray, ellipse, intrinsics, image_is_prepared=True,
+            prepared_gray, ellipse, intrinsics, image_is_prepared=True, camera_model=camera_model,
         )
         radius = max(ellipse[1]) / 2.0
         measured = np.asarray(estimate.projected_center_px, dtype=np.float64)
@@ -833,6 +867,7 @@ def _refine_image_centres(
             image_record.refinement_status[target_id] = {
                 "method": "unchanged",
                 "intrinsics": [float(value) for value in intrinsics],
+                "camera_model": camera_model.key,
                 "reason": estimate.reason if not estimate.valid else "centre displacement gate",
                 "edge_rms_px": (
                     float(estimate.edge_rms_px)
@@ -850,6 +885,7 @@ def _refine_image_centres(
         image_record.refinement_status[target_id] = {
             "method": estimate.method,
             "intrinsics": [float(value) for value in intrinsics],
+            "camera_model": camera_model.key,
             "reason": estimate.reason,
             "edge_rms_px": (
                 float(estimate.edge_rms_px)
@@ -866,6 +902,7 @@ def refine_detected_centers_after_calibration(
     max_id_hamming_distance: int = 0,
     codebook: Set[int] | None = None,
     workers: int = 1,
+    camera_models: Dict[str, CameraModel] | None = None,
 ) -> dict[str, int]:
     """Refine existing verified observations without full-frame redetection.
 
@@ -899,7 +936,8 @@ def refine_detected_centers_after_calibration(
             intrinsics = camera_intrinsics.get(cam_name)
             if intrinsics is None:
                 continue
-            cache_current, model_p95, model_max = _cached_model_is_current(images, intrinsics)
+            camera_model = (camera_models or {}).get(cam_name, DEFAULT_CAMERA_MODEL)
+            cache_current, model_p95, model_max = _cached_model_is_current(images, intrinsics, camera_model)
             if cache_current:
                 updated[cam_name] = 0
                 print(
@@ -923,7 +961,10 @@ def refine_detected_centers_after_calibration(
                 f"cached detections={evidence_before}/{sum(len(image.detections) for image in images)}",
                 flush=True,
             )
-            arguments = [(record, intrinsics, valid_ids, max_id_hamming_distance, codebook) for record in images]
+            arguments = [
+                (record, intrinsics, valid_ids, max_id_hamming_distance, codebook, camera_model)
+                for record in images
+            ]
             if workers > 1 and pool is None:
                 pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_detection_worker)
             if pool is not None:
@@ -1080,6 +1121,7 @@ def initialize_multi_camera_state(
     known_targets3d: Dict[int, np.ndarray] | None = None,
     known_baseline: float | None = None,
     reuse_known_world_poses: bool = False,
+    camera_models: Dict[str, CameraModel] | None = None,
 ) -> MultiCameraState:
     """Build a MultiCameraState from SfM outputs and CCT detections.
 
@@ -1094,6 +1136,7 @@ def initialize_multi_camera_state(
     solved cameras.
     """
     ref_cam = camera_names[0]
+    camera_models = {name: (camera_models or {}).get(name, DEFAULT_CAMERA_MODEL) for name in camera_names}
 
     # Compute relative poses
     relative_poses: Dict[str, np.ndarray] = {ref_cam: identity_pose()}
@@ -1212,11 +1255,18 @@ def initialize_multi_camera_state(
 
                 object_points = np.array([points[tid] for tid in shared_ids], dtype=np.float64)
                 image_points = np.array([det.detections[tid] for tid in shared_ids], dtype=np.float64)
+                camera_matrix, distortion, pnp_points, usable = camera_models[cam_name].pnp_inputs(
+                    sfm_intrinsics[cam_name], image_points,
+                )
+                if np.count_nonzero(usable) < 6:
+                    continue
+                object_points, pnp_points = object_points[usable], pnp_points[usable]
+                shared_ids = [tid for tid, keep in zip(shared_ids, usable) if keep]
                 solved, rotation_vec, translation_vec, inliers = cv2.solvePnPRansac(
                     object_points,
-                    image_points,
-                    intrinsics_matrix(sfm_intrinsics[cam_name]),
-                    distortion_vector(sfm_intrinsics[cam_name]),
+                    pnp_points,
+                    camera_matrix,
+                    distortion,
                     flags=cv2.SOLVEPNP_ITERATIVE,
                     reprojectionError=8.0,
                     iterationsCount=200,
@@ -1227,9 +1277,9 @@ def initialize_multi_camera_state(
                 inlier_indices = inliers.reshape(-1)
                 refined, rotation_vec, translation_vec = cv2.solvePnP(
                     object_points[inlier_indices],
-                    image_points[inlier_indices],
-                    intrinsics_matrix(sfm_intrinsics[cam_name]),
-                    distortion_vector(sfm_intrinsics[cam_name]),
+                    pnp_points[inlier_indices],
+                    camera_matrix,
+                    distortion,
                     rvec=rotation_vec,
                     tvec=translation_vec,
                     useExtrinsicGuess=True,
@@ -1249,7 +1299,9 @@ def initialize_multi_camera_state(
                 projected_errors: List[float] = []
                 for target_id in shared_ids:
                     pose_for_camera = abs_pose if cam_name != ref_cam else candidate_rig_pose
-                    projected = project_point(sfm_intrinsics[cam_name], pose_for_camera, points[target_id])
+                    projected = project_point(
+                        sfm_intrinsics[cam_name], pose_for_camera, points[target_id], camera_models[cam_name],
+                    )
                     projected_errors.append(float(np.linalg.norm(projected - det.detections[target_id])))
                 median_error = float(np.median(projected_errors)) if projected_errors else float("inf")
                 score = (len(inlier_indices), -median_error)
@@ -1292,10 +1344,11 @@ def initialize_multi_camera_state(
             proj_matrices.append(P)
             # DLT uses the ideal pinhole projection K[R|t]; measured centres
             # remain in the original distorted image for subsequent BA.
-            undistorted = cv2.undistortPoints(
-                np.asarray(pt2d, dtype=np.float64).reshape(1, 1, 2),
-                K, distortion_vector(sfm_intrinsics[cam_name]), P=K,
-            )[0, 0]
+            # Fisheye directions beyond 90 degrees have no pinhole image and
+            # make the track non-finite (it is then not triangulated).
+            undistorted = camera_models[cam_name].undistort_pixels(
+                sfm_intrinsics[cam_name], np.asarray(pt2d, dtype=np.float64).reshape(1, 2),
+            )[0]
             pts_2d.append(undistorted)
 
         if not np.all(np.isfinite(pts_2d)):
@@ -1329,7 +1382,7 @@ def initialize_multi_camera_state(
             depth = (R @ pt3d + abs_pose[3:])[2]
             if depth > 1e-6:
                 n_depth_ok += 1
-            projected = project_point(sfm_intrinsics[cam_name], abs_pose, pt3d)
+            projected = project_point(sfm_intrinsics[cam_name], abs_pose, pt3d, camera_models[cam_name])
             err = float(np.linalg.norm(projected - pt2d))
             reproj_errors.append(err)
 
@@ -1362,6 +1415,7 @@ def initialize_multi_camera_state(
         relative_poses=relative_poses,
         points=points,
         camera_names=camera_names,
+        camera_models=camera_models,
     )
     state._fixed_point_ids = fixed_point_ids  # type: ignore[attr-defined]
     return state
@@ -1565,20 +1619,25 @@ def _solve_known_target_pose(
     known_targets3d: Dict[int, np.ndarray],
     intrinsics: np.ndarray,
     min_shared: int,
+    camera_model: CameraModel = DEFAULT_CAMERA_MODEL,
 ) -> tuple[np.ndarray, int, float] | None:
     """Estimate one world-to-camera pose with fixed bootstrap K and distortion."""
     correspondences = _known_target_correspondences(image, known_targets3d, min_shared)
     if correspondences is None:
         return None
     _, object_points, image_points = correspondences
-    camera_matrix = intrinsics_matrix(intrinsics)
-    distortion = distortion_vector(intrinsics)
     required_inliers = max(6, int(min_shared))
+    # OpenCV PnP sees ideal pinhole pixels for models it cannot represent;
+    # the support test below always uses the full model on all points.
+    camera_matrix, distortion, pnp_points, usable = camera_model.pnp_inputs(intrinsics, image_points)
+    if np.count_nonzero(usable) < required_inliers:
+        return None
+    pnp_index = np.flatnonzero(usable).astype(np.int32)
 
     try:
         solved, rotation_vec, translation_vec, inliers = cv2.solvePnPRansac(
-            object_points,
-            image_points,
+            object_points[pnp_index],
+            pnp_points[pnp_index],
             camera_matrix,
             distortion,
             flags=cv2.SOLVEPNP_EPNP,
@@ -1592,29 +1651,29 @@ def _solve_known_target_pose(
     if not solved or inliers is None or len(inliers) < required_inliers:
         try:
             solved, rotation_vec, translation_vec = cv2.solvePnP(
-                object_points,
-                image_points,
+                object_points[pnp_index],
+                pnp_points[pnp_index],
                 camera_matrix,
                 distortion,
                 flags=cv2.SOLVEPNP_ITERATIVE,
             )
-            inliers = np.arange(len(object_points), dtype=np.int32).reshape(-1, 1)
+            inliers = np.arange(len(pnp_index), dtype=np.int32).reshape(-1, 1)
         except cv2.error:
             return None
     if not solved or rotation_vec is None or translation_vec is None:
         return None
 
-    inlier_indices = np.asarray(inliers, dtype=np.int32).reshape(-1)
+    inlier_indices = pnp_index[np.asarray(inliers, dtype=np.int32).reshape(-1)]
     try:
         if hasattr(cv2, "solvePnPRefineLM"):
             rotation_vec, translation_vec = cv2.solvePnPRefineLM(
-                object_points[inlier_indices], image_points[inlier_indices],
+                object_points[inlier_indices], pnp_points[inlier_indices],
                 camera_matrix, distortion, rotation_vec, translation_vec,
                 criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, 1e-7),
             )
         else:
             _, rotation_vec, translation_vec = cv2.solvePnP(
-                object_points[inlier_indices], image_points[inlier_indices],
+                object_points[inlier_indices], pnp_points[inlier_indices],
                 camera_matrix, distortion, rvec=rotation_vec, tvec=translation_vec,
                 useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
             )
@@ -1627,18 +1686,17 @@ def _solve_known_target_pose(
         ).astype(np.float64)
         rotation_value = rotation_matrix_from_pose(pose_value)
         errors_value = np.asarray([
-            float(np.linalg.norm(project_point(intrinsics, pose_value, point) - measured))
+            float(np.linalg.norm(project_point(intrinsics, pose_value, point, camera_model) - measured))
             for point, measured in zip(object_points, image_points)
         ], dtype=np.float64)
-        depths_value = np.asarray([
-            float((rotation_value @ point + pose_value[3:])[2])
-            for point in object_points
-        ], dtype=np.float64)
+        projectable_value = camera_model.is_projectable(
+            np.asarray(object_points, dtype=np.float64) @ rotation_value.T + pose_value[3:]
+        )
         supported_value = (
             np.isfinite(errors_value)
             & (errors_value <= 8.0)
-            & np.isfinite(depths_value)
-            & (depths_value > 1e-8)
+            & projectable_value
+            & usable
         )
         return pose_value, errors_value, supported_value
 
@@ -1653,13 +1711,13 @@ def _solve_known_target_pose(
     try:
         if hasattr(cv2, "solvePnPRefineLM"):
             rotation_vec, translation_vec = cv2.solvePnPRefineLM(
-                object_points[supported_indices], image_points[supported_indices],
+                object_points[supported_indices], pnp_points[supported_indices],
                 camera_matrix, distortion, rotation_vec, translation_vec,
                 criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, 1e-7),
             )
         else:
             _, rotation_vec, translation_vec = cv2.solvePnP(
-                object_points[supported_indices], image_points[supported_indices],
+                object_points[supported_indices], pnp_points[supported_indices],
                 camera_matrix, distortion, rvec=rotation_vec, tvec=translation_vec,
                 useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
             )
@@ -1723,6 +1781,7 @@ def bootstrap_from_known_targets(
     camera_names: List[str],
     known_targets3d: Dict[int, np.ndarray],
     min_shared: int,
+    camera_models: Dict[str, CameraModel] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, np.ndarray]]]:
     """Estimate per-camera intrinsics and absolute poses without SfM.
 
@@ -1733,6 +1792,7 @@ def bootstrap_from_known_targets(
     poses_by_camera: Dict[str, Dict[str, np.ndarray]] = {}
 
     for cam_name in camera_names:
+        camera_model = (camera_models or {}).get(cam_name, DEFAULT_CAMERA_MODEL)
         cam_detections = detections_by_camera.get(cam_name, [])
         calibration_frames, candidate_frames, all_eligible_frames = _select_bootstrap_frames(
             cam_detections,
@@ -1758,7 +1818,7 @@ def bootstrap_from_known_targets(
         for subset_index, subset in enumerate(subsets, start=1):
             try:
                 state_candidate, _ = initialize_known_target_state(
-                    subset, known_targets3d, min_shared,
+                    subset, known_targets3d, min_shared, camera_model,
                 )
             except (cv2.error, ValueError) as exc:
                 print(
@@ -1809,7 +1869,7 @@ def bootstrap_from_known_targets(
             validation_solved = 0
             for image in validation_frames:
                 solved = _solve_known_target_pose(
-                    image, known_targets3d, state_candidate.intrinsics, min_shared,
+                    image, known_targets3d, state_candidate.intrinsics, min_shared, camera_model,
                 )
                 if solved is not None:
                     validation_solved += 1
@@ -1828,7 +1888,7 @@ def bootstrap_from_known_targets(
                 _, object_points, image_points = correspondences
                 train_errors.extend(
                     float(np.linalg.norm(
-                        project_point(state_candidate.intrinsics, pose, point) - measured,
+                        project_point(state_candidate.intrinsics, pose, point, camera_model) - measured,
                     ))
                     for point, measured in zip(object_points, image_points)
                 )
@@ -1871,7 +1931,7 @@ def bootstrap_from_known_targets(
         failures = 0
         for frame_number, image in enumerate(cam_detections, start=1):
             solved = _solve_known_target_pose(
-                image, known_targets3d, state.intrinsics, min_shared
+                image, known_targets3d, state.intrinsics, min_shared, camera_model,
             )
             if solved is None:
                 failures += 1
@@ -1907,15 +1967,17 @@ def bootstrap_from_known_targets(
 class MultiCamReprojectionCost(pyceres.CostFunction):
     """Reprojection residual for a single observation.
 
-    Parameter blocks: [intrinsics(8), rig_pose(6), relative_rvec(3), relative_tvec(3), point(3)]
+    Parameter blocks: [intrinsics(model.num_params), rig_pose(6), relative_rvec(3),
+    relative_tvec(3), point(3)].
     The absolute camera pose is: compose(rig_pose, relative_rvec, relative_tvec).
     """
 
-    def __init__(self, observation: np.ndarray):
+    def __init__(self, observation: np.ndarray, model: CameraModel = DEFAULT_CAMERA_MODEL):
         super().__init__()
         self.observation = observation.astype(np.float64)
+        self.model = model
         self.set_num_residuals(2)
-        self.set_parameter_block_sizes([8, 6, 3, 3, 3])
+        self.set_parameter_block_sizes([model.num_params, 6, 3, 3, 3])
 
     def Evaluate(self, parameters, residuals, jacobians):
         intrinsics = np.array(parameters[0], dtype=np.float64, copy=True)
@@ -1925,7 +1987,7 @@ class MultiCamReprojectionCost(pyceres.CostFunction):
         point = np.array(parameters[4], dtype=np.float64, copy=True)
 
         abs_pose = compose_pose_from_parts(rig_pose, rel_rvec, rel_tvec)
-        prediction = project_point(intrinsics, abs_pose, point)
+        prediction = project_point(intrinsics, abs_pose, point, self.model)
         residual_vec = prediction - self.observation
         residuals[0] = float(residual_vec[0])
         residuals[1] = float(residual_vec[1])
@@ -1945,8 +2007,8 @@ class MultiCamReprojectionCost(pyceres.CostFunction):
 
                     abs_plus = compose_pose_from_parts(plus_blocks[1], plus_blocks[2], plus_blocks[3])
                     abs_minus = compose_pose_from_parts(minus_blocks[1], minus_blocks[2], minus_blocks[3])
-                    res_plus = project_point(plus_blocks[0], abs_plus, plus_blocks[4]) - self.observation
-                    res_minus = project_point(minus_blocks[0], abs_minus, minus_blocks[4]) - self.observation
+                    res_plus = project_point(plus_blocks[0], abs_plus, plus_blocks[4], self.model) - self.observation
+                    res_minus = project_point(minus_blocks[0], abs_minus, minus_blocks[4], self.model) - self.observation
                     jac[:, col] = (res_plus - res_minus) / (2.0 * step)
 
                 for row in range(2):
@@ -1971,8 +2033,10 @@ def multi_cam_collect_observations(
     observations: List[Tuple[str, str, int, np.ndarray]] = []
     for cam_name, dets in detections_by_camera.items():
         intrinsics = state.camera_intrinsics[cam_name]
+        camera_model = state.model(cam_name)
         rel_pose = state.relative_poses[cam_name]
         field_radius: float | None = None
+        field_angle: float | None = None
         for det in dets:
             stem = det.image_path.stem
             rig_pose = state.rig_poses.get(stem)
@@ -1980,28 +2044,37 @@ def multi_cam_collect_observations(
                 continue
             abs_pose = compose_poses(rig_pose, rel_pose)
             rotation = rotation_matrix_from_pose(abs_pose)
-            if field_radius is None and det.width > 0 and det.height > 0:
-                # Pinhole radius of the image corners; a radius test rather than
-                # a pixel test, because the polynomial distortion model can fold
-                # far off-axis directions back into the image.
+            if field_radius is None and field_angle is None and det.width > 0 and det.height > 0:
+                # Field of view from the image corners; a radius (angle) test
+                # rather than a pixel test, because the polynomial distortion
+                # model can fold far off-axis directions back into the image.
                 corners = np.array([[0.0, 0.0], [det.width - 1.0, 0.0], [0.0, det.height - 1.0],
-                                    [det.width - 1.0, det.height - 1.0]]).reshape(-1, 1, 2)
-                undistorted = cv2.undistortPoints(corners, intrinsics_matrix(intrinsics),
-                                                  distortion_vector(intrinsics)).reshape(-1, 2)
-                field_radius = 1.1 * float(np.max(np.linalg.norm(undistorted, axis=1)))
+                                    [det.width - 1.0, det.height - 1.0]])
+                if camera_model.is_fisheye:
+                    rays = camera_model.bearings(intrinsics, corners)
+                    angles = np.arctan2(np.hypot(rays[:, 0], rays[:, 1]), rays[:, 2])
+                    if np.any(np.isfinite(angles)):
+                        field_angle = min(np.pi, 1.1 * float(np.nanmax(angles)))
+                else:
+                    undistorted = camera_model.normalize(intrinsics, corners)
+                    radii = np.linalg.norm(undistorted, axis=1)
+                    if np.any(np.isfinite(radii)):
+                        field_radius = 1.1 * float(np.nanmax(radii))
             for target_id, pt2d in det.detections.items():
                 pt3d = state.points.get(target_id)
                 if pt3d is None:
                     continue
                 camera_point = rotation @ pt3d + abs_pose[3:]
-                if camera_point[2] <= 1e-9 or (
-                    field_radius is not None
-                    and np.hypot(camera_point[0], camera_point[1]) > field_radius * camera_point[2]
+                radius = np.hypot(camera_point[0], camera_point[1])
+                if not bool(camera_model.is_projectable(camera_point)) or (
+                    field_radius is not None and radius > field_radius * camera_point[2]
+                ) or (
+                    field_angle is not None and np.arctan2(radius, camera_point[2]) > field_angle
                 ):
                     if unobservable is not None:
                         unobservable.append((cam_name, stem, target_id, pt2d))
                     continue
-                residual = project_point(intrinsics, abs_pose, pt3d) - pt2d
+                residual = project_point(intrinsics, abs_pose, pt3d, camera_model) - pt2d
                 if not np.all(np.isfinite(residual)):
                     continue
                 if max_reprojection_error is None or np.linalg.norm(residual) <= max_reprojection_error:
@@ -2025,18 +2098,9 @@ def multi_cam_compute_object_space_residual(
     rotation = rotation_matrix_from_pose(abs_pose)
     camera_center = camera_center_from_pose(abs_pose)
 
-    undistorted = cv2.undistortPoints(
-        np.asarray(pt2d, dtype=np.float64).reshape(1, 1, 2),
-        intrinsics_matrix(intrinsics),
-        distortion_vector(intrinsics),
-    )
-    if undistorted is None:
-        return None
-
-    ray_camera = np.array(
-        [undistorted[0, 0, 0], undistorted[0, 0, 1], 1.0],
-        dtype=np.float64,
-    )
+    ray_camera = state.model(cam_name).bearings(
+        intrinsics, np.asarray(pt2d, dtype=np.float64).reshape(1, 2),
+    )[0]
     ray_camera_norm = np.linalg.norm(ray_camera)
     if not np.isfinite(ray_camera_norm) or ray_camera_norm <= 1e-12:
         return None
@@ -2125,7 +2189,7 @@ def multi_cam_compute_reprojection_errors(
         if rig_pose is None or pt3d is None:
             continue
         abs_pose = compose_poses(rig_pose, state.relative_poses[cam_name])
-        residual = project_point(intrinsics, abs_pose, pt3d) - pt2d
+        residual = project_point(intrinsics, abs_pose, pt3d, state.model(cam_name)) - pt2d
         if np.all(np.isfinite(residual)):
             errors.append(float(np.linalg.norm(residual)))
     return np.array(errors, dtype=np.float64)
@@ -2165,7 +2229,6 @@ def _linearised_adjustment_diagnostics(
     from scipy.stats import chi2
 
     warnings: List[str] = []
-    intr_names = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2"]
     pose_names = ["rx", "ry", "rz", "tx", "ty", "tz"]
 
     # Keep blocks exactly as they were passed to Ceres: array identity matters.
@@ -2193,7 +2256,7 @@ def _linearised_adjustment_diagnostics(
         status = "fixed" if problem.is_parameter_block_constant(block) else "estimated"
         initial = (initial_camera_intrinsics or {}).get(cam_name, block).copy()
         global_specs.append((
-            [f"{cam_name}.{name}" for name in intr_names], block, initial,
+            [f"{cam_name}.{name}" for name in state.model(cam_name).param_names], block, initial,
             [_status_for(block, index, status) for index in range(block.size)],
         ))
 
@@ -2504,7 +2567,7 @@ def solve_multi_cam_bundle_adjustment(
     """Joint bundle adjustment over all cameras.
 
     Parameter blocks per observation:
-      - camera intrinsics (8)  — shared per camera
+      - camera intrinsics (model.num_params)  — shared per camera
       - rig pose (6)          — shared per frame
       - relative pose (6)     — fixed per non-reference camera
       - 3D point (3)
@@ -2531,7 +2594,7 @@ def solve_multi_cam_bundle_adjustment(
     used_points: set = set()
 
     for cam_name, stem, target_id, pt2d in observations:
-        cost = MultiCamReprojectionCost(pt2d)
+        cost = MultiCamReprojectionCost(pt2d, state.model(cam_name))
         rel_pose = state.relative_poses[cam_name]
         problem.add_residual_block(
             cost,
@@ -2631,9 +2694,10 @@ def solve_multi_cam_bundle_adjustment(
         problem.set_parameter_upper_bound(intr, 2, 0.75 * w_est)
         problem.set_parameter_lower_bound(intr, 3, 0.25 * h_est)
         problem.set_parameter_upper_bound(intr, 3, 0.75 * h_est)
-        for di in range(4, 8):
-            problem.set_parameter_lower_bound(intr, di, -1.0)
-            problem.set_parameter_upper_bound(intr, di, 1.0)
+        coefficient_lower, coefficient_upper = state.model(cam_name).coefficient_bounds()
+        for di, (lower, upper) in enumerate(zip(coefficient_lower, coefficient_upper), start=4):
+            problem.set_parameter_lower_bound(intr, di, float(lower))
+            problem.set_parameter_upper_bound(intr, di, float(upper))
 
     options = pyceres.SolverOptions()
     options.linear_solver_type = pyceres.LinearSolverType.DENSE_SCHUR
@@ -2687,7 +2751,7 @@ def save_multi_cam_colmap_output(
     # cameras.txt — one camera per sensor
     cam_lines = [
         "# Camera list with one line of data per camera:",
-        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[fx,fy,cx,cy,k1,k2,p1,p2]",
+        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]",
     ]
     cam_id_map: Dict[str, int] = {}
     for idx, cam_name in enumerate(state.camera_names):
@@ -2699,10 +2763,10 @@ def save_multi_cam_colmap_output(
         if detections_by_camera.get(cam_name):
             w = detections_by_camera[cam_name][0].width
             h = detections_by_camera[cam_name][0].height
+        camera_model = state.model(cam_name)
         cam_lines.append(
-            f"{cam_id} OPENCV {w} {h} "
-            f"{intr[0]:.9f} {intr[1]:.9f} {intr[2]:.9f} {intr[3]:.9f} "
-            f"{intr[4]:.9f} {intr[5]:.9f} {intr[6]:.9f} {intr[7]:.9f}"
+            f"{cam_id} {camera_model.colmap_model_name} {w} {h} "
+            + " ".join(f"{value:.9f}" for value in camera_model.colmap_params(intr))
         )
     (colmap_dir / "cameras.txt").write_text("\n".join(cam_lines) + "\n", encoding="utf-8")
 
@@ -2829,15 +2893,11 @@ def save_report(
         if cam_object_errors.size:
             lines.append(f"  Mean object-space error: {float(np.mean(cam_object_errors)):.6f} m")
             lines.append(f"  RMS object-space error:  {float(np.sqrt(np.mean(np.square(cam_object_errors)))):.6f} m")
-        lines.append(f"  Intrinsics (OPENCV):")
-        lines.append(f"    fx = {intr[0]:.6f}")
-        lines.append(f"    fy = {intr[1]:.6f}")
-        lines.append(f"    cx = {intr[2]:.6f}")
-        lines.append(f"    cy = {intr[3]:.6f}")
-        lines.append(f"    k1 = {intr[4]:.6f}")
-        lines.append(f"    k2 = {intr[5]:.6f}")
-        lines.append(f"    p1 = {intr[6]:.6f}")
-        lines.append(f"    p2 = {intr[7]:.6f}")
+        camera_model = state.model(cam_name)
+        lines.append(f"  Camera model: {camera_model.describe()}")
+        lines.append(f"  Intrinsics ({camera_model.colmap_model_name}):")
+        for name, value in zip(camera_model.param_names, intr):
+            lines.append(f"    {name} = {value:.6f}")
 
         rp = state.relative_poses[cam_name]
         R_rel = rotation_matrix_from_pose(rp)
@@ -2863,9 +2923,17 @@ def save_kalibr_camchain(
 
     Kalibr format uses a 4x4 T_cn_cnm1 matrix expressing the transformation
     from camera n-1 to camera n.  Camera 0 has no such field.
-    Distortion model: radtan [k1, k2, p1, p2].
+    Distortion model: radtan [k1, k2, p1, p2] (pinhole) or equidistant
+    [k1, k2, k3, k4] (OPENCV_FISHEYE).  Kalibr has no equivalent of the
+    extended models; no file is written then and None is returned.
     """
     camchain: dict = {}
+    unsupported = [
+        name for name in state.camera_names
+        if state.model(name).kalibr_entry(state.camera_intrinsics[name]) is None
+    ]
+    if unsupported:
+        return None
 
     for idx, cam_name in enumerate(state.camera_names):
         intr = state.camera_intrinsics[cam_name]
@@ -2878,13 +2946,13 @@ def save_kalibr_camchain(
             h = detections_by_camera[cam_name][0].height
 
         cam_key = f"cam{idx}"
+        kalibr = state.model(cam_name).kalibr_entry(intr)
         cam_entry: dict = {
-            "camera_model": "pinhole",
+            "camera_model": kalibr["camera_model"],
             "intrinsics": [float(intr[0]), float(intr[1]),
                            float(intr[2]), float(intr[3])],
-            "distortion_model": "radtan",
-            "distortion_coeffs": [float(intr[4]), float(intr[5]),
-                                  float(intr[6]), float(intr[7])],
+            "distortion_model": kalibr["distortion_model"],
+            "distortion_coeffs": kalibr["distortion_coeffs"],
             "resolution": [int(w), int(h)],
             "rostopic": f"/{cam_name}/image_raw",
         }
@@ -2999,8 +3067,7 @@ def evaluate_independent_checkpoints(
     reprojection: list[dict] = []
     for camera, images in checkpoint_images.items():
         intrinsics = state.camera_intrinsics[camera]
-        matrix = intrinsics_matrix(intrinsics)
-        distortion = distortion_vector(intrinsics)
+        camera_model = state.model(camera)
         for image in images:
             stem = image.image_path.stem
             if stem not in calibrated_frame_stems:
@@ -3014,26 +3081,30 @@ def evaluate_independent_checkpoints(
             for target_id, measured in image.detections.items():
                 if target_id not in checkpoint_ids:
                     continue
-                normalized = cv2.undistortPoints(
-                    np.asarray(measured, dtype=np.float64).reshape(1, 1, 2), matrix, distortion,
-                )[0, 0]
-                direction = rotation.T @ np.array([normalized[0], normalized[1], 1.0])
+                ray = camera_model.bearings(intrinsics, np.asarray(measured, dtype=np.float64).reshape(1, 2))[0]
+                if not np.all(np.isfinite(ray)):
+                    continue
+                direction = rotation.T @ ray
                 direction /= np.linalg.norm(direction)
                 by_target[target_id].append({
                     "camera": camera, "frame": stem, "center": center, "direction": direction,
                     "pose": pose, "measured": np.asarray(measured, dtype=np.float64),
                 })
-                predicted = project_point(intrinsics, pose, known_targets3d[target_id])
+                predicted = project_point(intrinsics, pose, known_targets3d[target_id], camera_model)
                 delta = predicted - measured
                 reference_delta = known_targets3d[target_id] - center
                 object_error = float(np.linalg.norm(
                     reference_delta - direction * float(reference_delta @ direction)
                 ))
+                depth = float((rotation @ known_targets3d[target_id] + pose[3:])[2])
                 reprojection.append({
                     "target_id": int(target_id), "camera": camera, "frame": stem,
                     "du_px": float(delta[0]), "dv_px": float(delta[1]),
                     "error_px": float(np.linalg.norm(delta)),
                     "object_error_m": object_error,
+                    "depth_m": depth,
+                    # Ground sampling distance: object-space size of one pixel at the target.
+                    "gsd_m": depth / (0.5 * (float(intrinsics[0]) + float(intrinsics[1]))),
                 })
 
     targets: list[dict] = []
@@ -3066,8 +3137,13 @@ def evaluate_independent_checkpoints(
             targets.append(result)
             continue
         reconstructed = np.linalg.solve(normal, rhs)
+        # In front of every camera: along each viewing ray (this also holds
+        # for fisheye directions beyond 90 degrees, where the depth is < 0).
         positive = all(
-            float((rotation_matrix_from_pose(item["pose"]) @ reconstructed + item["pose"][3:])[2]) > 0
+            float(item["direction"] @ (reconstructed - item["center"])) > 0
+            and bool(state.model(item["camera"]).is_projectable(
+                rotation_matrix_from_pose(item["pose"]) @ reconstructed + item["pose"][3:]
+            ))
             for item in rays
         )
         if not positive:
@@ -3165,6 +3241,7 @@ def parse_combined_args(argv: Sequence[str] | None = None) -> argparse.Namespace
         help="A-priori 1-sigma precision of each measured image coordinate, in pixels. "
              "Enables standardized residuals and the observed-to-assumed residual variance ratio.",
     )
+    add_camera_model_arguments(parser)
     parser.add_argument("--min-detections", type=int, default=5)
     parser.add_argument("--min-shared", type=int, default=6)
     parser.add_argument("--max-reprojection-error", type=float, default=12.0)
@@ -3206,6 +3283,11 @@ def parse_combined_args(argv: Sequence[str] | None = None) -> argparse.Namespace
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_combined_args(argv)
+    try:
+        camera_model = camera_model_from_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", flush=True)
+        return 1
     image_root: Path = args.image_root.resolve()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3241,6 +3323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: no images or camera folders with images found in {image_root}", flush=True)
         return 1
     print(f"cameras: {camera_names}", flush=True)
+    camera_models: Dict[str, CameraModel] = {name: camera_model for name in camera_names}
+    print(f"camera model: {camera_model.describe()}", flush=True)
     if known_targets3d is None:
         print(
             "WARNING: no --targets3d supplied. Calibration from coded targets with known coordinates is "
@@ -3285,6 +3369,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             image_root, camera_names, sfm_dir,
             known_baseline=args.known_baseline,
             force=args.force_sfm,
+            camera_models=camera_models,
         )
         for cam_name in camera_names:
             intr = sfm_intrinsics[cam_name]
@@ -3297,6 +3382,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("=" * 60, flush=True)
     print("STEP 2: CCT target detection", flush=True)
     print("=" * 60, flush=True)
+    # The detector's optional calibrated centre refinement takes OPENCV-8
+    # intrinsics; other models are refined after the first adjustment only.
+    detection_intrinsics = (
+        sfm_intrinsics
+        if sfm_intrinsics and all(camera_models[name].is_legacy_opencv8 for name in camera_names)
+        else None
+    )
 
     detections_by_camera = detect_all_cameras(
         image_root, camera_names, output_dir,
@@ -3304,7 +3396,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_id_hamming_distance=args.max_id_hamming_distance,
         min_detections=args.min_detections,
         force=args.force_detections,
-        initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
+        initial_intrinsics=detection_intrinsics,
         codebook=codebook,
         workers=workers,
     )
@@ -3327,7 +3419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_id_hamming_distance=args.max_id_hamming_distance,
                 min_detections=args.min_detections,
                 force=True,
-                initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
+                initial_intrinsics=detection_intrinsics,
                 codebook=codebook,
                 workers=workers,
             )
@@ -3385,6 +3477,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             camera_names,
             calibration_targets3d,
             args.min_shared,
+            camera_models=camera_models,
         )
 
     # ── Step 3: Initialize multi-camera state ────────────────────
@@ -3398,6 +3491,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         known_targets3d=calibration_targets3d,
         known_baseline=args.known_baseline,
         reuse_known_world_poses=args.skip_sfm,
+        camera_models=camera_models,
     )
     initial_camera_intrinsics = {
         name: values.copy() for name, values in state.camera_intrinsics.items()
@@ -3463,6 +3557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_id_hamming_distance=args.max_id_hamming_distance,
         codebook=codebook,
         workers=workers,
+        camera_models=camera_models,
     )
     center_update_history = [dict(center_updates)]
     # Checkpoint newly recovered ellipse evidence immediately. If a later BA
@@ -3581,6 +3676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_id_hamming_distance=args.max_id_hamming_distance,
         codebook=codebook,
         workers=workers,
+        camera_models=camera_models,
     )
     center_update_history.append(dict(final_center_updates))
     if sum(final_center_updates.values()) > 0:
@@ -3629,6 +3725,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_id_hamming_distance=args.max_id_hamming_distance,
             codebook=codebook,
             workers=workers,
+            camera_models=camera_models,
         )
         for camera, images in posed_checkpoint_images.items():
             save_refinement_cache(images, output_dir / camera, merge_existing=True)
@@ -3709,12 +3806,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "observations": len(cam_obs),
             "mean_reprojection_error": float(np.mean(cam_errors)) if cam_errors.size else 0.0,
             "rms_reprojection_error": float(np.sqrt(np.mean(np.square(cam_errors)))) if cam_errors.size else 0.0,
-            "intrinsics": {
-                "fx": float(intr[0]), "fy": float(intr[1]),
-                "cx": float(intr[2]), "cy": float(intr[3]),
-                "k1": float(intr[4]), "k2": float(intr[5]),
-                "p1": float(intr[6]), "p2": float(intr[7]),
-            },
+            "camera_model": state.model(cam_name).to_dict(),
+            "intrinsics": state.model(cam_name).coefficient_dict(intr),
         }
     overall["cameras"] = per_camera
 
@@ -3810,7 +3903,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Save Kalibr camchain
     kalibr_path = save_kalibr_camchain(state, detections_by_camera, output_dir)
-    print(f"Kalibr camchain: {kalibr_path}", flush=True)
+    if kalibr_path is not None:
+        print(f"Kalibr camchain: {kalibr_path}", flush=True)
+    else:
+        stale = output_dir / "camchain.yaml"
+        if stale.exists():
+            stale.unlink()
+        print("Kalibr camchain: not written (Kalibr has no equivalent of "
+              f"{camera_model.colmap_model_name})", flush=True)
 
     # ── Rich PDF report ──────────────────────────────────────────
     if not args.no_pdf_report:
@@ -3820,7 +3920,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 generate_pdf_report,
             )
 
-            meta = {"Image root": str(image_root)}
+            meta = {"Image root": str(image_root), "Camera model": camera_model.describe()}
             if args.targets3d is not None:
                 meta["Known 3-D targets"] = str(args.targets3d)
             if baseline_value is not None:

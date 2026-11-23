@@ -150,7 +150,7 @@ def evaluate_detections(
             if target_id not in known_targets3d or target_id not in entry["detections"]:
                 continue
             local, center = camera_frame(camera, pose, known_targets3d[target_id])
-            if local[2] > 0:
+            if local[2] > 0 and bool(state.model(camera).is_projectable(local)):
                 radius_samples[target_id].append(0.5 * max(ellipse[1]) * float(local[2]) / focal)
                 centres_seen[target_id].append(center)
     per_target_radius = {t: float(np.median(v)) for t, v in radius_samples.items() if v}
@@ -183,9 +183,9 @@ def evaluate_detections(
         for target_id, point in known_targets3d.items():
             local, center = camera_frame(camera, pose, point)
             depth = float(local[2])
-            if depth <= 1e-6:
+            if depth <= 1e-6 or not bool(state.model(camera).is_projectable(local)):
                 continue
-            uv = project_point(intrinsics, pose, point)
+            uv = project_point(intrinsics, pose, point, state.model(camera))
             dot_radius = focal * per_target_radius.get(target_id, default_radius) / depth
             incidence = None
             if target_id in normals:

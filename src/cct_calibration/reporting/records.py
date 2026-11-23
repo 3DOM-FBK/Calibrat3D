@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 
+from cct_calibration.camera_models import DEFAULT_CAMERA_MODEL, CameraModel
 from cct_calibration.run import (
     ImageDetections,
     SolverDiagnostics,
@@ -66,9 +67,10 @@ class CameraInfo:
     name: str
     width: int
     height: int
-    intrinsics: np.ndarray    # [fx, fy, cx, cy, k1, k2, p1, p2]
+    intrinsics: np.ndarray    # [fx, fy, cx, cy, *model.coefficients]
     n_images_detected: int = 0   # images with >= min_detections (input to BA)
     n_images_total: int = 0      # all images found on disk
+    model: CameraModel = DEFAULT_CAMERA_MODEL
 
 
 @dataclass
@@ -129,7 +131,7 @@ def records_from_multi_camera(
         if rig_pose is None or pt3d is None:
             continue
         abs_pose = compose_poses(rig_pose, state.relative_poses[cam_name])
-        pred = project_point(intr, abs_pose, pt3d)
+        pred = project_point(intr, abs_pose, pt3d, state.model(cam_name))
         dx = float(pred[0] - pt2d[0])
         dy = float(pred[1] - pt2d[1])
         radial = np.array([pt2d[0] - intr[2], pt2d[1] - intr[3]], dtype=np.float64)
@@ -198,6 +200,7 @@ def build_multi_camera_report_data(
             height=int(h),
             intrinsics=state.camera_intrinsics[cam_name].copy(),
             n_images_detected=len(dets),
+            model=state.model(cam_name),
         ))
 
     records = records_from_multi_camera(state, observations)

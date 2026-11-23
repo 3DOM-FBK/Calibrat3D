@@ -640,21 +640,47 @@ def fig_depth_distribution(data: ReportData) -> plt.Figure:
 # ---------------------------------------------------------------------------
 
 def fig_distortion_profile(cam: CameraInfo) -> plt.Figure:
-    intr = cam.intrinsics
-    k1, k2, p1, p2 = intr[4], intr[5], intr[6], intr[7]
+    """Distortion relative to the undistorted projection of the same model.
+
+    The abscissa is the undistorted model coordinate: the normalised radius
+    for a pinhole camera, the angle from the axis (rad) for a fisheye.  The
+    radial curve uses only the radial coefficients; the remaining terms
+    (tangential, thin prism) are shown along the image diagonal.
+    """
+    intr = np.asarray(cam.intrinsics, dtype=np.float64)
+    model = cam.model
     focal = 0.5 * (intr[0] + intr[1])
     corner_r = float(np.hypot(cam.width / 2.0 / intr[0], cam.height / 2.0 / intr[1]))
+    if model.is_fisheye:
+        corner_r = float(np.arctan(corner_r))
     r = np.linspace(0, corner_r * 1.05, 300)
 
-    radial_factor = 1 + k1 * r ** 2 + k2 * r ** 4
-    dr_px = focal * r * (radial_factor - 1.0)
+    radial_names = {"opencv": {"k1", "k2", "k3", "k4", "k5", "k6"},
+                    "thin_prism": {"k1", "k2", "k3", "k4"},
+                    "rad_tan_thin_prism": {"k0", "k1", "k2", "k3", "k4", "k5"}}[model.family]
+    radial_model = model.with_coefficients([name for name in model.coefficients if name in radial_names])
+    radial_intr = np.concatenate([intr[:4], [value for name, value in zip(model.coefficients, intr[4:])
+                                             if name in radial_names]])
+    ideal_model = model.with_coefficients(())
 
-    # tangential displacement evaluated along the diagonal x = y = r/sqrt(2)
+    def image_offsets(camera_model, values, x, y):
+        a = np.column_stack([x, y])
+        if camera_model.is_fisheye:
+            theta = np.hypot(a[:, 0], a[:, 1])
+            with np.errstate(invalid="ignore", divide="ignore"):
+                direction = np.where(theta[:, None] > 0, a / np.where(theta > 0, theta, 1.0)[:, None], 0.0)
+            rays = np.column_stack([np.sin(theta)[:, None] * direction, np.cos(theta)])
+        else:
+            rays = np.column_stack([a, np.ones(len(a))])
+        pixels, _ = camera_model.project(values, rays)
+        return (pixels - intr[2:4]) / intr[:2]
+
+    zero = np.zeros_like(r)
+    ideal = image_offsets(ideal_model, intr[:4], r, zero)
+    dr_px = focal * (image_offsets(radial_model, radial_intr, r, zero)[:, 0] - ideal[:, 0])
     xd = yd = r / np.sqrt(2.0)
-    rsq = xd ** 2 + yd ** 2
-    dtx = 2 * p1 * xd * yd + p2 * (rsq + 2 * xd ** 2)
-    dty = p1 * (rsq + 2 * yd ** 2) + 2 * p2 * xd * yd
-    tang_px = focal * np.hypot(dtx, dty)
+    other = image_offsets(model, intr, xd, yd) - image_offsets(radial_model, radial_intr, xd, yd)
+    tang_px = focal * np.hypot(other[:, 0], other[:, 1])
 
     fig, ax = plt.subplots(figsize=(8.2, 4.0), constrained_layout=True)
     ax.plot(r, dr_px, color=ACCENT, lw=2.2, label="radial $\\Delta r$")
@@ -663,10 +689,14 @@ def fig_distortion_profile(cam: CameraInfo) -> plt.Figure:
     ax.annotate("image corner", xy=(corner_r, ax.get_ylim()[1] * 0.05),
                 fontsize=9, color="#555555", ha="right", rotation=90)
     ax.axhline(0.0, color="#CCCCCC", lw=0.8)
-    ax.set_xlabel("normalised radius from principal point")
+    ax.set_xlabel("angle from optical axis (rad)" if model.is_fisheye
+                  else "normalised radius from principal point")
     ax.set_ylabel("displacement (px)")
-    ax.set_title(f"{cam.name}: distortion profile  ($k_1$={k1:.4f}, $k_2$={k2:.4f}, "
-                 f"$p_1$={p1:.4f}, $p_2$={p2:.4f})")
+    coefficients = ", ".join(
+        f"${name[0]}_{{{name[1:]}}}$={value:.4g}" for name, value in zip(model.coefficients, intr[4:])
+    )
+    ax.set_title(f"{cam.name}: distortion profile ({model.colmap_model_name})\n{coefficients}",
+                 fontsize=10)
     ax.legend()
     return fig
 
@@ -1056,4 +1086,143 @@ def fig_checkpoint_accuracy(data: ReportData) -> plt.Figure | None:
     axes[1].set_xlabel("maximum ray-intersection angle (deg)")
     axes[1].set_ylabel("3D error (mm)")
     axes[1].set_title("Accuracy versus intersection geometry")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Ground sampling distance
+# ---------------------------------------------------------------------------
+
+def _binned_quantiles(x: np.ndarray, y: np.ndarray, bins: int = 10):
+    """Equal-count bins of x: (bin centre, median y, 90th-percentile y)."""
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    edges = np.unique(np.quantile(x, np.linspace(0.0, 1.0, bins + 1)))
+    centres, medians, p90 = [], [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (x >= lo) & (x <= hi)
+        if np.count_nonzero(mask) >= 5:
+            centres.append(float(np.median(x[mask])))
+            medians.append(float(np.median(y[mask])))
+            p90.append(float(np.percentile(y[mask], 90)))
+    return np.array(centres), np.array(medians), np.array(p90)
+
+
+def fig_gsd_distribution(data: ReportData) -> plt.Figure | None:
+    from cct_calibration.reporting.statistics import observation_gsd_mm
+
+    gsd = observation_gsd_mm(data)
+    if not np.any(np.isfinite(gsd)):
+        return None
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.2, 3.8), constrained_layout=True)
+    frames_all = sorted({record.frame for record in data.records})
+    frame_index = {frame: index for index, frame in enumerate(frames_all)}
+    for camera in data.cameras:
+        mask = np.array([record.camera == camera.name for record in data.records]) & np.isfinite(gsd)
+        if not np.any(mask):
+            continue
+        values = gsd[mask]
+        color = _camera_color(camera.name)
+        ax1.hist(values, bins=40, histtype="step", lw=1.6, color=color, label=f"{camera.name} (n={values.size})")
+        ax1.axvline(np.median(values), color=color, ls="--", lw=1.0)
+        per_frame: Dict[str, List[float]] = {}
+        for record, value in zip([r for r, keep in zip(data.records, mask) if keep], values):
+            per_frame.setdefault(record.frame, []).append(value)
+        xs = [frame_index[frame] for frame in per_frame]
+        ax2.scatter(xs, [np.median(v) for v in per_frame.values()], s=10, color=color,
+                    alpha=0.8, label=camera.name)
+    ax1.set_xlabel("GSD at the target (mm/px)")
+    ax1.set_ylabel("observations")
+    ax1.set_title("GSD distribution of retained observations")
+    ax1.legend(fontsize=7)
+    ax2.set_xlabel("frame (acquisition order)")
+    ax2.set_ylabel("median GSD in frame (mm/px)")
+    ax2.set_title("GSD along the acquisition")
+    if len(data.cameras) > 1:
+        ax2.legend(fontsize=7)
+    return fig
+
+
+def fig_residuals_vs_gsd(data: ReportData) -> plt.Figure | None:
+    from cct_calibration.reporting.statistics import observation_gsd_mm
+
+    gsd = observation_gsd_mm(data)
+    pixel = np.array([record.err_px for record in data.records], dtype=np.float64)
+    ray = np.array([record.err_obj_m * 1000.0 if record.err_obj_m is not None else np.nan
+                    for record in data.records], dtype=np.float64)
+    valid = np.isfinite(gsd) & np.isfinite(pixel) & np.isfinite(ray)
+    if np.count_nonzero(valid) < 20:
+        return None
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.2, 3.9), constrained_layout=True)
+    for camera in data.cameras:
+        mask = valid & np.array([record.camera == camera.name for record in data.records])
+        color = _camera_color(camera.name)
+        ax1.scatter(gsd[mask], pixel[mask], s=3, alpha=0.18, color=color, label=camera.name)
+        ax2.scatter(gsd[mask], ray[mask], s=3, alpha=0.18, color=color, label=camera.name)
+    centres, med_px, p90_px = _binned_quantiles(gsd[valid], pixel[valid])
+    ax1.plot(centres, med_px, color="#1D3557", lw=2.0, marker="o", ms=3, label="binned median")
+    ax1.plot(centres, p90_px, color="#1D3557", lw=1.2, ls="--", label="binned P90")
+    ax1.set_xlabel("GSD at the target (mm/px)")
+    ax1.set_ylabel("reprojection error (px)")
+    ax1.set_title("Image residual vs. GSD")
+    ax1.set_ylim(0, float(np.percentile(pixel[valid], 99.5)) * 1.1)
+    ax1.legend(fontsize=7, markerscale=3)
+    centres, med_ray, p90_ray = _binned_quantiles(gsd[valid], ray[valid])
+    ax2.plot(centres, med_ray, color="#1D3557", lw=2.0, marker="o", ms=3, label="binned median")
+    ax2.plot(centres, p90_ray, color="#1D3557", lw=1.2, ls="--", label="binned P90")
+    span = np.linspace(0.0, float(np.nanmax(gsd[valid])), 50)
+    for factor, style in ((1.0, ":"), (2.0, "-.")):
+        ax2.plot(span, factor * span, color="#6C757D", lw=1.0, ls=style, label=f"{factor:g} × GSD")
+    ax2.set_xlabel("GSD at the target (mm/px)")
+    ax2.set_ylabel("point-to-ray error (mm)")
+    ax2.set_title("Ray error vs. GSD")
+    ax2.set_ylim(0, float(np.percentile(ray[valid], 99.5)) * 1.1)
+    ax2.legend(fontsize=7, markerscale=3)
+    return fig
+
+
+def fig_gsd_normalized_errors(data: ReportData, checkpoint) -> plt.Figure | None:
+    from cct_calibration.reporting.statistics import observation_gsd_mm
+
+    gsd = observation_gsd_mm(data)
+    ray = np.array([record.err_obj_m * 1000.0 if record.err_obj_m is not None else np.nan
+                    for record in data.records], dtype=np.float64)
+    ratio = ray / gsd
+    if not np.any(np.isfinite(ratio)):
+        return None
+    panels = 2 if checkpoint is not None else 1
+    fig, axes = plt.subplots(1, panels, figsize=(9.2 if panels == 2 else 6.0, 3.8), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    ax = axes[0]
+    for camera in data.cameras:
+        mask = np.isfinite(ratio) & np.array([record.camera == camera.name for record in data.records])
+        if np.any(mask):
+            sns.ecdfplot(ratio[mask], ax=ax, color=_camera_color(camera.name),
+                         label=f"{camera.name}: calibration rays")
+    if checkpoint is not None and checkpoint.withheld_ray_error_gsd.size:
+        sns.ecdfplot(checkpoint.withheld_ray_error_gsd, ax=ax, color="#C1121F", ls="--",
+                     label="withheld checkpoint rays")
+    ax.axvline(1.0, color="#6C757D", lw=1.0, ls=":")
+    ax.set_xlabel("point-to-ray error / GSD (pixels at the target)")
+    ax.set_ylabel("cumulative fraction")
+    ax.set_title("Ray error in GSD units")
+    upper = np.nanpercentile(ratio, 99)
+    if checkpoint is not None and checkpoint.withheld_ray_error_gsd.size:
+        upper = max(upper, float(np.percentile(checkpoint.withheld_ray_error_gsd, 99)))
+    ax.set_xlim(0, upper * 1.05)
+    ax.legend(fontsize=7)
+    if checkpoint is not None:
+        ax = axes[1]
+        ax.scatter(checkpoint.target_gsd_mm, checkpoint.target_error_mm, s=26, color="#C1121F", zorder=3)
+        for tid, x, y in zip(checkpoint.target_ids, checkpoint.target_gsd_mm, checkpoint.target_error_mm):
+            ax.annotate(str(tid), (x, y), fontsize=6, xytext=(3, 2), textcoords="offset points")
+        span = np.linspace(0.0, float(checkpoint.target_gsd_mm.max()) * 1.1, 20)
+        for factor, style in ((0.5, "-."), (1.0, ":")):
+            ax.plot(span, factor * span, color="#6C757D", lw=1.0, ls=style, label=f"{factor:g} × GSD")
+        ax.set_xlabel("median GSD of the checkpoint's rays (mm/px)")
+        ax.set_ylabel("checkpoint 3D error (mm)")
+        ax.set_title("Checkpoint accuracy vs. GSD")
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=7)
     return fig

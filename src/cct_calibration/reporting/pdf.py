@@ -52,11 +52,14 @@ from cct_calibration.reporting.plots import (
     fig_distortion_profile,
     fig_error_distribution,
     fig_frame_target_residuals,
+    fig_gsd_distribution,
+    fig_gsd_normalized_errors,
     fig_outlier_diagnostics,
     fig_parameter_correlation,
     fig_pose_and_viewing_coverage,
     fig_projection_uncertainty,
     fig_radial_error,
+    fig_residuals_vs_gsd,
     fig_residual_component_heatmaps,
     fig_rig_pair_quality,
     fig_rig_diagram,
@@ -73,6 +76,8 @@ from cct_calibration.reporting.statistics import (
     ErrorStats,
     compute_rig_pair_stats,
     compute_richness,
+    gsd_camera_stats,
+    gsd_checkpoint_stats,
     per_camera_stats,
     signed_residual_stats,
     weakest_frames_and_targets,
@@ -309,6 +314,8 @@ def generate_pdf_report(
         [item["object_error_m"] * 1000.0 for item in checkpoint_observations]
     )
     cam_stats = per_camera_stats(data)
+    gsd_stats = {item.camera: item for item in gsd_camera_stats(data)}
+    gsd_checkpoints = gsd_checkpoint_stats(data)
     signed = signed_residual_stats(data.records)
     n_fixed = len(data.rig.fixed_point_ids) if data.rig else 0
     rich = compute_richness(data.records, len(data.cameras), n_fixed)
@@ -436,7 +443,7 @@ def generate_pdf_report(
     story.append(Spacer(1, 4 * mm))
 
     cam_header = ["Camera", "Resolution", "Obs", "Mean", "RMS", "Median", "P95",
-                  "Max (px)", "Ray med. (mm)", "FoV occupancy"]
+                  "Max (px)", "Ray med. (mm)", "GSD med. (mm/px)", "FoV occupancy"]
     cam_rows = []
     for cs in cam_stats:
         cam_info = next(c for c in data.cameras if c.name == cs.camera)
@@ -445,6 +452,7 @@ def generate_pdf_report(
             cs.camera, f"{cam_info.width}×{cam_info.height}", f"{cs.errors.n:,}",
             f"{cs.errors.mean:.2f}", f"{cs.errors.rms:.2f}", f"{cs.errors.median:.2f}",
             f"{cs.errors.p95:.2f}", f"{cs.errors.max:.2f}", ray_med,
+            f"{gsd_stats[cs.camera].median_mm:.2f}" if cs.camera in gsd_stats else "—",
             f"{100 * cs.coverage.occupancy_fraction:.0f}%",
         ])
     story.append(_data_table(cam_header, cam_rows, styles=S))
@@ -473,6 +481,13 @@ def generate_pdf_report(
                          f"(median {fs.median_residual * 1000:.2f} + "
                          f"{fs.mad_scale:.1f}·{fs.spread_source.upper()} "
                          f"{fs.mad * 1000:.2f})"])
+    for gsd_item in gsd_stats.values():
+        red_rows.append([f"Ground sampling distance, {gsd_item.camera} (median, P5–P95)",
+                         f"{gsd_item.median_mm:.2f} mm/px ({gsd_item.p5_mm:.2f}–{gsd_item.p95_mm:.2f})"])
+    if gsd_checkpoints is not None:
+        red_rows.append(["Checkpoint 3D RMSE in GSD units",
+                         f"{gsd_checkpoints.rmse_3d_gsd:.2f} × median checkpoint GSD "
+                         f"({gsd_checkpoints.rmse_3d_mm:.2f} mm / {gsd_checkpoints.median_gsd_mm:.2f} mm/px)"])
     if data.rig is not None and data.rig.fixed_point_ids:
         red_rows.append(["Ground-truth anchored targets",
                          f"{len(data.rig.fixed_point_ids)} of {rich.n_targets}"])
@@ -741,6 +756,75 @@ def generate_pdf_report(
             "is reported separately when an a-priori image-coordinate sigma is provided.", S["caption"],
         ))
         story.append(PageBreak())
+        sec_idx += 1
+
+    if gsd_stats:
+        story += _section(str(sec_idx), "Ground sampling distance", S)
+        story.append(Paragraph(
+            "The ground sampling distance (GSD) of an observation is the object-space size of one "
+            "pixel at the target, GSD = Z / f, with Z the target depth in the camera frame and f the "
+            "mean of fx and fy (a plane parallel to the sensor; lens distortion and target-surface "
+            "obliquity are not included). Dividing the point-to-ray error by the GSD of its ray "
+            "expresses it in pixels at the target, which makes errors comparable across distances.",
+            S["body"],
+        ))
+        story.append(Spacer(1, 2 * mm))
+        gsd_rows = [[
+            item.camera, f"{item.n:,}",
+            f"{item.min_mm:.2f} / {item.p5_mm:.2f} / {item.median_mm:.2f} / {item.p95_mm:.2f} / {item.max_mm:.2f}",
+            f"{item.frame_median_min_mm:.2f}–{item.frame_median_max_mm:.2f}",
+            f"{item.ray_error_gsd_median:.2f} / {item.ray_error_gsd_rms:.2f} / {item.ray_error_gsd_p95:.2f}",
+            f"{item.pixel_error_gsd_spearman:+.2f}",
+        ] for item in gsd_stats.values()]
+        story.append(_data_table(
+            ["Camera", "Obs", "GSD min / P5 / median / P95 / max (mm/px)", "Frame-median GSD range",
+             "Ray error / GSD: median / RMS / P95", "Spearman ρ (pixel error, GSD)"],
+            gsd_rows, styles=S))
+        story.append(Paragraph(
+            "Spearman ρ tests whether image residuals grow (ρ > 0) or shrink (ρ < 0) with GSD, i.e. "
+            "with distance; values near zero indicate a distance-independent image precision.",
+            S["caption"],
+        ))
+        if gsd_checkpoints is not None:
+            story.append(Spacer(1, 3 * mm))
+            withheld = gsd_checkpoints.withheld_ray_error_gsd
+            story.append(_data_table(["Checkpoint accuracy relative to GSD", "Value"], [
+                ["Checkpoints with GSD", f"{gsd_checkpoints.n_targets}"],
+                ["Median GSD of checkpoint rays", f"{gsd_checkpoints.median_gsd_mm:.2f} mm/px"],
+                ["3D RMSE", f"{gsd_checkpoints.rmse_3d_mm:.2f} mm = {gsd_checkpoints.rmse_3d_gsd:.2f} GSD"],
+                ["Per-target 3D error / GSD: median / max",
+                 f"{gsd_checkpoints.median_error_gsd:.2f} / {gsd_checkpoints.max_error_gsd:.2f}"],
+                ["Withheld ray error / GSD: median / P95",
+                 f"{np.median(withheld):.2f} / {np.percentile(withheld, 95):.2f}" if withheld.size else "—"],
+            ], col_widths=[70 * mm, CONTENT_W - 70 * mm], styles=S))
+        story.append(PageBreak())
+        distribution_fig = fig_gsd_distribution(data)
+        if distribution_fig is not None:
+            story.append(_img(distribution_fig))
+            story.append(Paragraph(
+                "Left: GSD of all retained observations (dashed: median per camera). Right: median "
+                "GSD per frame in acquisition order, i.e. the working distance along the survey.",
+                S["caption"],
+            ))
+            story.append(Spacer(1, 4 * mm))
+        residual_fig = fig_residuals_vs_gsd(data)
+        if residual_fig is not None:
+            story.append(_img(residual_fig))
+            story.append(Paragraph(
+                "Lines are medians and 90th percentiles in equal-count GSD bins. Dotted and dash-dotted "
+                "lines mark ray errors of one and two GSD.", S["caption"],
+            ))
+        story.append(PageBreak())
+        normalized_fig = fig_gsd_normalized_errors(data, gsd_checkpoints)
+        if normalized_fig is not None:
+            story.append(_img(normalized_fig))
+            story.append(Paragraph(
+                "Ray error divided by the GSD of the same ray (1 = one pixel at the target). Withheld "
+                "checkpoint rays are projected with the frozen calibration from reference coordinates."
+                + (" Right: checkpoint 3D error against the median GSD of its observing rays."
+                   if gsd_checkpoints is not None else ""), S["caption"],
+            ))
+            story.append(PageBreak())
         sec_idx += 1
 
     story += _section(str(sec_idx), "Network strength and observation geometry", S)

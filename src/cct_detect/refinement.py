@@ -154,8 +154,16 @@ def prepare_refinement_image(gray: np.ndarray) -> np.ndarray:
 
 def refine_projected_center(gray: np.ndarray, ellipse: Ellipse,
                             intrinsics: np.ndarray | None = None,
-                            *, image_is_prepared: bool = False) -> CenterEstimate:
-    """Refine a physical centre conditional on an OPENCV-8 calibration."""
+                            *, image_is_prepared: bool = False,
+                            camera_model=None) -> CenterEstimate:
+    """Refine a physical centre conditional on a calibration.
+
+    Without ``camera_model`` the intrinsics are the OPENCV-8 vector
+    ``[fx, fy, cx, cy, k1, k2, p1, p2]``.  A camera model object (see
+    ``cct_calibration.camera_models.CameraModel``) supplies the mapping between
+    distorted and ideal pinhole pixels for any other model.  Edges are fitted
+    in the ideal pinhole image, where a circle projects to an ellipse.
+    """
     initial = np.asarray(ellipse[0], dtype=float)
 
     def unavailable(reason: str) -> CenterEstimate:
@@ -164,9 +172,24 @@ def refine_projected_center(gray: np.ndarray, ellipse: Ellipse,
     if intrinsics is None:
         return unavailable("calibrated distortion model required for physical-centre refinement")
     intrinsics = np.asarray(intrinsics, dtype=float)
-    if intrinsics.shape != (8,) or not np.all(np.isfinite(intrinsics)) or min(intrinsics[:2]) <= 0:
-        return unavailable("invalid OPENCV-8 calibration")
+    expected = 8 if camera_model is None else camera_model.num_params
+    if intrinsics.shape != (expected,) or not np.all(np.isfinite(intrinsics)) or min(intrinsics[:2]) <= 0:
+        return unavailable("invalid calibration for the camera model")
     matrix = np.array([[intrinsics[0], 0, intrinsics[2]], [0, intrinsics[1], intrinsics[3]], [0, 0, 1.]])
+
+    def undistort(pixels: np.ndarray) -> np.ndarray:
+        if camera_model is not None:
+            return camera_model.undistort_pixels(intrinsics, pixels)
+        return cv2.undistortPoints(pixels.reshape(-1, 1, 2), matrix, intrinsics[4:8], P=matrix).reshape(-1, 2)
+
+    def distort(ideal_pixels: np.ndarray) -> np.ndarray:
+        if camera_model is not None:
+            return camera_model.distort_pixels(intrinsics, ideal_pixels)
+        rays = np.column_stack([(ideal_pixels[:, 0] - intrinsics[2]) / intrinsics[0],
+                                (ideal_pixels[:, 1] - intrinsics[3]) / intrinsics[1],
+                                np.ones(len(ideal_pixels))])
+        return cv2.projectPoints(rays, np.zeros(3), np.zeros(3), matrix, intrinsics[4:8])[0].reshape(-1, 2)
+
     if not image_is_prepared:
         gray = prepare_refinement_image(gray)
     fitted = []
@@ -175,21 +198,20 @@ def refine_projected_center(gray: np.ndarray, ellipse: Ellipse,
         if len(points) < 30:
             continue
         measured = points
-        points = cv2.undistortPoints(measured.reshape(-1, 1, 2), matrix, intrinsics[4:8], P=matrix).reshape(-1, 2)
+        points = undistort(np.asarray(measured, dtype=np.float64))
         if not np.all(np.isfinite(points)):
             continue
-        rays = np.column_stack([(points[:, 0] - intrinsics[2]) / intrinsics[0],
-                                 (points[:, 1] - intrinsics[3]) / intrinsics[1],
-                                 np.ones(len(points))])
-        roundtrip = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), matrix, intrinsics[4:8])[0].reshape(-1, 2)
-        if np.max(np.linalg.norm(roundtrip - measured, axis=1)) > 0.05:
+        roundtrip = distort(points)
+        if not np.all(np.isfinite(roundtrip)) or np.max(np.linalg.norm(roundtrip - measured, axis=1)) > 0.05:
             continue  # Finite output alone does not establish successful undistortion.
         fit = _fit_edge_ellipse(points)
         if fit is not None:
             fitted.append((ring, fit[0], fit[1]))
     if len(fitted) < 2:
         return unavailable("fewer than two supported concentric boundaries")
-    origin = cv2.undistortPoints(initial.reshape(1, 1, 2), matrix, intrinsics[4:8], P=matrix)[0, 0]
+    origin = undistort(initial.reshape(1, 2))[0]
+    if not np.all(np.isfinite(origin)):
+        return unavailable("ellipse centre has no ideal pinhole image")
     radius = max(ellipse[1]) / 2.0
     transform = np.array([[radius, 0, origin[0]], [0, radius, origin[1]], [0, 0, 1.]])
     estimates = []
@@ -210,9 +232,7 @@ def refine_projected_center(gray: np.ndarray, ellipse: Ellipse,
     center = estimates[0][1]
     if any(np.linalg.norm(other - center) > max(0.5, 0.03 * radius) for _, other in estimates[1:]):
         return unavailable("independent boundary pairs disagree on projected centre")
-    normalized = np.array([(center[0] - intrinsics[2]) / intrinsics[0],
-                            (center[1] - intrinsics[3]) / intrinsics[1], 1.])
-    projected = cv2.projectPoints(normalized.reshape(1, 3), np.zeros(3), np.zeros(3), matrix, intrinsics[4:8])[0].reshape(2)
+    projected = distort(np.asarray(center, dtype=np.float64).reshape(1, 2))[0]
     if not np.all(np.isfinite(projected)):
         return unavailable("nonfinite distorted centre projection")
     return CenterEstimate(initial, projected, None, "calibrated-concentric-conic", True,

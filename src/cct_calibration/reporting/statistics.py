@@ -396,8 +396,22 @@ def compute_rig_pair_stats(data: ReportData) -> List[RigPairStats]:
                 [0.0, camera_b.intrinsics[1], camera_b.intrinsics[3]],
                 [0.0, 0.0, 1.0],
             ])
-            distortion_a = camera_a.intrinsics[4:8]
-            distortion_b = camera_b.intrinsics[4:8]
+            # OpenCV's pinhole distortion where it applies; for other models
+            # the rectification is computed for the ideal pinhole images and
+            # measurements are undistorted by the camera model first.
+            distortion_a = camera_a.model.opencv_distortion(camera_a.intrinsics)
+            distortion_b = camera_b.model.opencv_distortion(camera_b.intrinsics)
+
+            def _undistort(camera, matrix, uv, R=None, P=None):
+                normalized = camera.model.normalize(camera.intrinsics, uv.reshape(1, 2))[0]
+                if R is None and P is None:
+                    return normalized
+                ray = np.array([normalized[0], normalized[1], 1.0])
+                if R is not None:
+                    ray = R @ ray
+                projected = (P[:, :3] if P is not None else np.eye(3)) @ (ray / ray[2])
+                return projected[:2] / projected[2]
+
             rectification = None
             if (camera_a.width, camera_a.height) == (camera_b.width, camera_b.height):
                 try:
@@ -424,14 +438,12 @@ def compute_rig_pair_stats(data: ReportData) -> List[RigPairStats]:
             for record_a, record_b in pairs:
                 uv_a = np.array([record_a.u_meas, record_a.v_meas], dtype=np.float64)
                 uv_b = np.array([record_b.u_meas, record_b.v_meas], dtype=np.float64)
-                norm_a = cv2.undistortPoints(uv_a.reshape(1, 1, 2), matrix_a, distortion_a)[0, 0]
-                norm_b = cv2.undistortPoints(uv_b.reshape(1, 1, 2), matrix_b, distortion_b)[0, 0]
-                undistorted_a_px = cv2.undistortPoints(
-                    uv_a.reshape(1, 1, 2), matrix_a, distortion_a, P=matrix_a,
-                )[0, 0]
-                undistorted_b_px = cv2.undistortPoints(
-                    uv_b.reshape(1, 1, 2), matrix_b, distortion_b, P=matrix_b,
-                )[0, 0]
+                norm_a = _undistort(camera_a, matrix_a, uv_a)
+                norm_b = _undistort(camera_b, matrix_b, uv_b)
+                if not (np.all(np.isfinite(norm_a)) and np.all(np.isfinite(norm_b))):
+                    continue
+                undistorted_a_px = _undistort(camera_a, matrix_a, uv_a, P=matrix_a)
+                undistorted_b_px = _undistort(camera_b, matrix_b, uv_b, P=matrix_b)
                 x_a = np.array([undistorted_a_px[0], undistorted_a_px[1], 1.0])
                 x_b = np.array([undistorted_b_px[0], undistorted_b_px[1], 1.0])
                 ex = fundamental @ x_a
@@ -443,8 +455,8 @@ def compute_rig_pair_stats(data: ReportData) -> List[RigPairStats]:
 
                 if rectification is not None:
                     r1, r2, p1, p2 = rectification[:4]
-                    rect_a = cv2.undistortPoints(uv_a.reshape(1, 1, 2), matrix_a, distortion_a, R=r1, P=p1)[0, 0]
-                    rect_b = cv2.undistortPoints(uv_b.reshape(1, 1, 2), matrix_b, distortion_b, R=r2, P=p2)[0, 0]
+                    rect_a = _undistort(camera_a, matrix_a, uv_a, R=r1, P=p1)
+                    rect_b = _undistort(camera_b, matrix_b, uv_b, R=r2, P=p2)
                     if disparity_component is not None:
                         vertical.append(float(rect_b[disparity_component] - rect_a[disparity_component]))
 
@@ -503,3 +515,125 @@ def per_camera_stats(data: ReportData) -> List[CameraReportStats]:
             depth_median_m=float(np.median(depths)) if depths else 0.0,
         ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Ground sampling distance
+# ---------------------------------------------------------------------------
+
+def observation_gsd_mm(data: ReportData) -> np.ndarray:
+    """Ground sampling distance of every record (mm per pixel, NaN if unknown).
+
+    GSD = Z / f, with Z the target depth in the camera frame and f the mean of
+    fx and fy: the object-space size of one pixel on a plane parallel to the
+    sensor at the target.  Lens distortion and target-surface obliquity are
+    not included.
+    """
+    focal = {camera.name: 0.5 * (float(camera.intrinsics[0]) + float(camera.intrinsics[1]))
+             for camera in data.cameras}
+    return np.array([
+        record.depth_m / focal[record.camera] * 1000.0
+        if record.depth_m is not None and record.depth_m > 0 and focal.get(record.camera) else np.nan
+        for record in data.records
+    ], dtype=np.float64)
+
+
+@dataclass
+class GsdCameraStats:
+    camera: str
+    n: int
+    min_mm: float
+    p5_mm: float
+    median_mm: float
+    p95_mm: float
+    max_mm: float
+    frame_median_min_mm: float
+    frame_median_max_mm: float
+    ray_error_gsd_median: float
+    ray_error_gsd_rms: float
+    ray_error_gsd_p95: float
+    pixel_error_gsd_spearman: float
+
+
+@dataclass
+class GsdCheckpointStats:
+    n_targets: int
+    median_gsd_mm: float
+    rmse_3d_mm: float
+    rmse_3d_gsd: float
+    median_error_gsd: float
+    max_error_gsd: float
+    target_ids: np.ndarray
+    target_gsd_mm: np.ndarray
+    target_error_mm: np.ndarray
+    withheld_ray_error_gsd: np.ndarray
+
+
+def gsd_camera_stats(data: ReportData) -> List[GsdCameraStats]:
+    from scipy.stats import spearmanr
+
+    gsd = observation_gsd_mm(data)
+    out: List[GsdCameraStats] = []
+    for camera in data.cameras:
+        mask = np.array([record.camera == camera.name for record in data.records]) & np.isfinite(gsd)
+        if not np.any(mask):
+            continue
+        values = gsd[mask]
+        records = [record for record, keep in zip(data.records, mask) if keep]
+        frames: Dict[str, List[float]] = {}
+        for record, value in zip(records, values):
+            frames.setdefault(record.frame, []).append(value)
+        frame_medians = np.array([np.median(v) for v in frames.values()])
+        ray = np.array([record.err_obj_m * 1000.0 if record.err_obj_m is not None else np.nan
+                        for record in records])
+        ratio = ray / values
+        ratio = ratio[np.isfinite(ratio)]
+        pixel = np.array([record.err_px for record in records])
+        rho = float(spearmanr(values, pixel).statistic) if values.size > 2 else float("nan")
+        out.append(GsdCameraStats(
+            camera=camera.name, n=int(values.size),
+            min_mm=float(values.min()), p5_mm=float(np.percentile(values, 5)),
+            median_mm=float(np.median(values)), p95_mm=float(np.percentile(values, 95)),
+            max_mm=float(values.max()),
+            frame_median_min_mm=float(frame_medians.min()), frame_median_max_mm=float(frame_medians.max()),
+            ray_error_gsd_median=float(np.median(ratio)) if ratio.size else float("nan"),
+            ray_error_gsd_rms=float(np.sqrt(np.mean(ratio ** 2))) if ratio.size else float("nan"),
+            ray_error_gsd_p95=float(np.percentile(ratio, 95)) if ratio.size else float("nan"),
+            pixel_error_gsd_spearman=rho,
+        ))
+    return out
+
+
+def gsd_checkpoint_stats(data: ReportData) -> GsdCheckpointStats | None:
+    """Checkpoint accuracy expressed relative to the GSD of the observing rays."""
+    quality = data.checkpoint_quality
+    if not quality:
+        return None
+    observations = [item for item in quality.get("reprojection_observations", []) if item.get("gsd_m")]
+    if not observations:
+        return None  # checkpoint file predates GSD recording
+    by_target: Dict[int, List[float]] = {}
+    for item in observations:
+        by_target.setdefault(int(item["target_id"]), []).append(float(item["gsd_m"]) * 1000.0)
+    ids, gsds, errors = [], [], []
+    for target in quality.get("targets", []):
+        if target.get("status") != "ok" or int(target["target_id"]) not in by_target:
+            continue
+        ids.append(int(target["target_id"]))
+        gsds.append(float(np.median(by_target[int(target["target_id"])])))
+        errors.append(float(target["error_3d_m"]) * 1000.0)
+    if not ids:
+        return None
+    gsds_a, errors_a = np.asarray(gsds), np.asarray(errors)
+    rmse = float(np.sqrt(np.mean(errors_a ** 2)))
+    median_gsd = float(np.median(gsds_a))
+    withheld = np.array([float(item["object_error_m"]) / float(item["gsd_m"]) for item in observations
+                         if item.get("object_error_m") is not None and float(item["gsd_m"]) > 0])
+    return GsdCheckpointStats(
+        n_targets=len(ids), median_gsd_mm=median_gsd, rmse_3d_mm=rmse,
+        rmse_3d_gsd=rmse / median_gsd if median_gsd > 0 else float("nan"),
+        median_error_gsd=float(np.median(errors_a / gsds_a)),
+        max_error_gsd=float(np.max(errors_a / gsds_a)),
+        target_ids=np.asarray(ids), target_gsd_mm=gsds_a, target_error_mm=errors_a,
+        withheld_ray_error_gsd=withheld,
+    )

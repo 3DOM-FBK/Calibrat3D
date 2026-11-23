@@ -124,7 +124,7 @@ uv run python run_cct_calibration.py \
   --targets3d "reference.txt"
 ```
 
-This is the standard mono workflow for a flat image folder. A single camera is calibrated as the one-camera case of the combined pipeline: the same centre refinement, staged adjustment, covariance diagnostics, optional checkpoints and PDF report are used, and only rig-specific results (relative orientation, stereo diagnostics) are omitted. With `--targets3d`, the camera is initialized from the known targets (no SfM). Any option of `run_combined.py` (e.g. `--checkpoints`, `--observation-sigma-px`, `--evaluate-detections`, `--no-pdf-report`) can be added. `run_combined.py --image-root <folder of images>` is equivalent.
+This is the standard mono workflow for a flat image folder. A single camera is calibrated as the one-camera case of the combined pipeline: the same centre refinement, staged adjustment, covariance diagnostics, optional checkpoints and PDF report are used, and only rig-specific results (relative orientation, stereo diagnostics) are omitted. With `--targets3d`, the camera is initialized from the known targets (no SfM). Any option of `run_combined.py` (e.g. `--checkpoints`, `--observation-sigma-px`, `--evaluate-detections`, `--no-pdf-report`, `--model fisheye`, `--dist k1 k2 k3 p1 p2`) can be added. `run_combined.py --image-root <folder of images>` is equivalent.
 
 Calibrating without `--targets3d` is possible but not recommended and prints a warning: initialization then uses natural-feature SfM, targets become free object points, and the scale of a single-camera solution is arbitrary (only the interior orientation is meaningful).
 
@@ -151,6 +151,27 @@ This runs detection only and exports the detections without performing pose init
 - `--checkpoint-seed`: reproducible integer seed for checkpoint selection (default `42`). The selected IDs and realised ratio are written to `checkpoint_split.json`.
 - `--force-detections`: ignore existing detection cache files and rerun target detection.
 - `--workers`: number of parallel image-processing workers for target detection, calibrated centre refinement and `--evaluate-detections` (default `0` = automatic, up to 8 limited by the CPU count; `1` = sequential). Results are identical; each worker holds one image in memory, so lower it for very large images on machines with little RAM.
+
+### Camera model flags
+
+The projection and distortion functions follow COLMAP's camera models exactly (`src/cct_calibration/camera_models.py`); the intrinsics vector is `fx fy cx cy` followed by the selected coefficients, and exports use the matching COLMAP model.
+
+- `--model {pinhole,fisheye}` (default `pinhole`).
+- `--dist NAME [NAME ...]`: distortion coefficients to estimate, given as a preset or as coefficient names (space- or comma-separated). Coefficients that are not listed are fixed at zero.
+
+| `--model` | `--dist` | Estimated coefficients | COLMAP / export model |
+|---|---|---|---|
+| `pinhole` | `opencv` (default) | k1 k2 p1 p2 | `OPENCV` |
+| `pinhole` | e.g. `k1 k2 k3 p1 p2` | any subset of k1 k2 p1 p2 k3 k4 k5 k6 | `FULL_OPENCV` (if beyond k1 k2 p1 p2) |
+| `pinhole` | `full_opencv` / `none` | all eight / none | `FULL_OPENCV` / `OPENCV` |
+| `fisheye` | `opencv_fisheye` (default) | k1 k2 k3 k4 | `OPENCV_FISHEYE` |
+| `fisheye` | e.g. `k1 k2 k3 k4 p1 p2` | any subset of k1 k2 p1 p2 k3 k4 sx1 sy1 | `THIN_PRISM_FISHEYE` (if beyond k1..k4) |
+| `fisheye` | `thin_prism_fisheye` | k1 k2 p1 p2 k3 k4 sx1 sy1 | `THIN_PRISM_FISHEYE` |
+| `fisheye` | `rad_tan_thin_prism_fisheye` | k0..k5 p0 p1 s0..s3 (or a subset) | `RAD_TAN_THIN_PRISM_FISHEYE` |
+
+- `--no-cheirality-check` (fisheye only): by default, as in COLMAP, points with camera depth `z <= 0` are not projectable. For lenses with a field of view above 180° this flag accepts them; the fisheye angle is computed as `atan2(r, z)`, which equals COLMAP's `atan(r / z)` in front of the camera. PnP-based initialisation and triangulation still use only directions below 90°.
+
+Kalibr's `camchain.yaml` is written only for models Kalibr can represent (`OPENCV` → radtan, `OPENCV_FISHEYE` → equidistant). Cached refined centres record the camera model they were measured with and are re-measured when the model changes.
 
 ### Multi-camera flags
 
@@ -200,6 +221,7 @@ The multi-camera pipeline automatically generates `calibration_report.pdf` in th
 - **Parameter determinability** — initial/final/status tables, marginal standard deviations and 95% intervals, the full correlation heatmap, a condition indicator, and the a-posteriori variance factor. Supplying `--observation-sigma-px` also enables a chi-square consistency test.
 - **Projection uncertainty** — intrinsic projection-uncertainty maps and joint calibration/triangulation uncertainty versus working distance.
 - **Per-camera deep dive** — binned signed-vector fields, separate u/v/radial/tangential heatmaps, error-vs-radius trends, distortion profiles, and density-aware FoV coverage.
+- **Ground sampling distance** — per-observation GSD (target depth / focal length, mm per pixel) with per-camera distributions and the GSD profile along the acquisition, image and point-to-ray residuals against GSD, ray errors expressed in GSD units, and checkpoint accuracy relative to the GSD of the checkpoint rays.
 - **Network strength** — pose, range, image-scale and field-angle distributions; camera-target connectivity; local reliability; and explicit weak-frame/weak-target tables. Surface-incidence angles are reported as unavailable unless target normals become part of the input model.
 - **Rig quality** (multi-camera only) — component-wise extrinsic uncertainty, shared support, Sampson error, rectified vertical disparity, stereo intersection angle, baseline/depth ratio, internal triangulation discrepancies, rig geometry and scene layout.
 

@@ -23,6 +23,7 @@ from cct_detect.detector import (
     CCTDetector as _CCTDetector,
     cyclic_hamming_distance,
 )
+from cct_calibration.camera_models import DEFAULT_CAMERA_MODEL, CameraModel
 
 
 @dataclass
@@ -823,7 +824,10 @@ def intrinsics_matrix(intrinsics: np.ndarray) -> np.ndarray:
     )
 
 
-def distortion_vector(intrinsics: np.ndarray) -> np.ndarray:
+def distortion_vector(intrinsics: np.ndarray, model: CameraModel | None = None) -> np.ndarray | None:
+    """OpenCV distortion vector; None for models OpenCV's pinhole functions cannot represent."""
+    if model is not None:
+        return model.opencv_distortion(intrinsics)
     return np.array([intrinsics[4], intrinsics[5], intrinsics[6], intrinsics[7]], dtype=np.float64)
 
 
@@ -832,7 +836,12 @@ def rotation_matrix_from_pose(pose: np.ndarray) -> np.ndarray:
     return rotation
 
 
-def project_point(intrinsics: np.ndarray, pose: np.ndarray, point: np.ndarray) -> np.ndarray:
+def project_point(
+    intrinsics: np.ndarray, pose: np.ndarray, point: np.ndarray, model: CameraModel | None = None,
+) -> np.ndarray:
+    """Project a world point; ``model`` None means the historical OPENCV-8 model."""
+    if model is not None and not model.is_legacy_opencv8:
+        return model.project_point(intrinsics, pose, point)
     rotation = rotation_matrix_from_pose(pose)
     point_camera = rotation @ point + pose[3:]
     z_coord = point_camera[2]
@@ -987,6 +996,7 @@ def _screened_focal_initialization(
     image_points_list: List[np.ndarray],
     width: int,
     height: int,
+    model: CameraModel = DEFAULT_CAMERA_MODEL,
 ) -> tuple[float, List[np.ndarray], List[np.ndarray]]:
     """Starting focal length for calibrateCamera, plus outlier-screened points.
 
@@ -998,6 +1008,10 @@ def _screened_focal_initialization(
     because unmodelled lens distortion alone can reach tens of pixels at the
     edge of a wide-angle image.  Frames left with fewer than six points keep
     their original correspondences.
+
+    Each candidate is the undistorted ``model`` (a plain pinhole, or the
+    equidistant projection for a fisheye), so a wide-angle fisheye is not
+    scored with a perspective projection it cannot follow.
     """
     size = float(max(width, height))
 
@@ -1005,22 +1019,35 @@ def _screened_focal_initialization(
         matrix = np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]])
         objects = object_points.reshape(-1, 3).astype(np.float64)
         pixels = image_points.reshape(-1, 2).astype(np.float64)
+        undistorted = model.initial_intrinsics(focal, width, height)
+        if model.is_opencv_pinhole:
+            pnp_objects, pnp_pixels = objects, pixels
+        else:
+            _, _, ideal, usable = model.pnp_inputs(undistorted, pixels)
+            if np.count_nonzero(usable) < 6:
+                return None
+            pnp_objects, pnp_pixels = objects[usable], ideal[usable]
         try:
             ok, rvec, tvec, _ = cv2.solvePnPRansac(
-                objects, pixels, matrix, None, flags=cv2.SOLVEPNP_EPNP,
+                pnp_objects, pnp_pixels, matrix, None, flags=cv2.SOLVEPNP_EPNP,
                 reprojectionError=max(8.0, 0.01 * size), iterationsCount=100,
             )
             if not ok:
                 return None
-            ok, rvec, tvec = cv2.solvePnP(objects, pixels, matrix, None, rvec, tvec,
+            ok, rvec, tvec = cv2.solvePnP(pnp_objects, pnp_pixels, matrix, None, rvec, tvec,
                                           useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
         except cv2.error:
             return None
         if not ok:
             return None
-        projected = cv2.projectPoints(objects, rvec, tvec, matrix, None)[0].reshape(-1, 2)
+        if model.is_opencv_pinhole:
+            projected = cv2.projectPoints(objects, rvec, tvec, matrix, None)[0].reshape(-1, 2)
+            errors = np.linalg.norm(projected - pixels, axis=1)
+            return errors if np.all(np.isfinite(errors)) else None
+        projected, valid = model.project_world(undistorted, rvec, tvec, objects)
         errors = np.linalg.norm(projected - pixels, axis=1)
-        return errors if np.all(np.isfinite(errors)) else None
+        errors[~valid | ~np.isfinite(errors)] = 1e6
+        return errors
 
     best_focal, best_score = size, float("inf")
     for focal in size * np.geomspace(0.15, 2.0, 25):
@@ -1053,13 +1080,15 @@ def _robust_intrinsic_adjustment(
     width: int,
     height: int,
     initial_focal: float,
+    model: CameraModel = DEFAULT_CAMERA_MODEL,
 ) -> tuple[float, np.ndarray, List[np.ndarray | None]]:
-    """Huber-robust fit of OPENCV-8 intrinsics and view poses to known targets.
+    """Huber-robust fit of ``model`` intrinsics and view poses to known targets.
 
-    Views are initialised by PnP at ``initial_focal``.  A pinhole stage
-    (distortion held at zero) precedes the full fit so that the distortion
-    terms start from a sensible focal length and principal point.  Bounds
-    match the bundle adjustment.  Returns the per-point RMS reprojection
+    Views are initialised by PnP at ``initial_focal``.  A stage without
+    distortion precedes the distortion fit so that the distortion terms start
+    from a sensible focal length and principal point; when the model has
+    more than the four leading coefficients they are freed in a last stage.
+    Bounds match the bundle adjustment.  Returns the per-point RMS reprojection
     error (pixels), the intrinsics and one pose per input view (None when the
     view could not be posed).
     """
@@ -1071,10 +1100,17 @@ def _robust_intrinsic_adjustment(
     objects = [np.asarray(o, dtype=np.float64).reshape(-1, 3) for o in object_points_list]
     pixels = [np.asarray(p, dtype=np.float64).reshape(-1, 2) for p in image_points_list]
     matrix = np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]])
+    intrinsics = model.initial_intrinsics(focal, width, height)
 
     initial_poses: List[np.ndarray | None] = []
     for obj, pix in zip(objects, pixels):
         pose = None
+        if not model.is_opencv_pinhole:
+            _, _, ideal, usable = model.pnp_inputs(intrinsics, pix)
+            if np.count_nonzero(usable) < 6:
+                initial_poses.append(None)
+                continue
+            obj, pix = obj[usable], ideal[usable]
         try:
             ok, rvec, tvec, _ = cv2.solvePnPRansac(
                 obj, pix, matrix, None, flags=cv2.SOLVEPNP_EPNP,
@@ -1089,12 +1125,12 @@ def _robust_intrinsic_adjustment(
             pose = None
         initial_poses.append(pose)
     active = [index for index, pose in enumerate(initial_poses) if pose is not None]
-    intrinsics = np.array([focal, focal, width / 2.0, height / 2.0, 0.0, 0.0, 0.0, 0.0])
     if len(active) < 2:
         return float("inf"), intrinsics, [None] * len(objects)
 
-    lower_all = np.array([0.2 * size, 0.2 * size, 0.25 * width, 0.25 * height, -1.0, -1.0, -1.0, -1.0])
-    upper_all = np.array([3.0 * size, 3.0 * size, 0.75 * width, 0.75 * height, 1.0, 1.0, 1.0, 1.0])
+    coefficient_lower, coefficient_upper = model.coefficient_bounds()
+    lower_all = np.concatenate([[0.2 * size, 0.2 * size, 0.25 * width, 0.25 * height], coefficient_lower])
+    upper_all = np.concatenate([[3.0 * size, 3.0 * size, 0.75 * width, 0.75 * height], coefficient_upper])
     poses = np.array([initial_poses[index] for index in active])
     row_counts = [2 * len(objects[index]) for index in active]
 
@@ -1102,12 +1138,29 @@ def _robust_intrinsic_adjustment(
         camera = np.array([[intr[0], 0.0, intr[2]], [0.0, intr[1], intr[3]], [0.0, 0.0, 1.0]])
         out = []
         for slot, index in enumerate(active):
-            projected = cv2.projectPoints(objects[index], pose_block[slot, :3], pose_block[slot, 3:],
-                                          camera, intr[4:8])[0].reshape(-1, 2)
+            if model.is_opencv_pinhole:
+                projected = cv2.projectPoints(objects[index], pose_block[slot, :3], pose_block[slot, 3:],
+                                              camera, model.opencv_distortion(intr))[0].reshape(-1, 2)
+            else:
+                projected, valid = model.project_world(intr, pose_block[slot, :3], pose_block[slot, 3:],
+                                                       objects[index])
+                # Unprojectable correspondences get a large constant residual
+                # (bounded by the Huber loss, no gradient).
+                projected = np.where(valid[:, None], projected, pixels[index] + 1e3)
             out.append((projected - pixels[index]).reshape(-1))
         return np.concatenate(out)
 
-    for free in (np.arange(4), np.arange(8)):
+    leading = {"opencv": ("k1", "k2", "p1", "p2"), "thin_prism": ("k1", "k2", "k3", "k4"),
+               "rad_tan_thin_prism": ("k0", "k1", "k2", "k3")}[model.family]
+    stages: List[np.ndarray] = []
+    for stage in (
+        np.arange(4),
+        np.array([0, 1, 2, 3] + [4 + i for i, name in enumerate(model.coefficients) if name in leading]),
+        np.arange(model.num_params),
+    ):
+        if not any(np.array_equal(stage, previous) for previous in stages):
+            stages.append(stage)
+    for free in stages:
         def unpack(x: np.ndarray):
             intr = intrinsics.copy()
             intr[free] = x[:free.size]
@@ -1145,6 +1198,7 @@ def initialize_known_target_state(
     images: Sequence[ImageDetections],
     known_targets3d: Dict[int, np.ndarray],
     min_shared: int,
+    model: CameraModel = DEFAULT_CAMERA_MODEL,
 ) -> tuple[CalibrationState, Set[int]]:
     if not images:
         raise RuntimeError("No images passed the detection count filter.")
@@ -1180,10 +1234,10 @@ def initialize_known_target_state(
     # for nearly identical inputs.  The robust adjustment below starts from
     # a data-driven focal length and per-view PnP poses instead.
     initial_focal, object_points_list, image_points_list = _screened_focal_initialization(
-        object_points_list, image_points_list, width, height,
+        object_points_list, image_points_list, width, height, model,
     )
     calibration_rms, intrinsics, solved_poses = _robust_intrinsic_adjustment(
-        object_points_list, image_points_list, width, height, initial_focal,
+        object_points_list, image_points_list, width, height, initial_focal, model,
     )
     poses = {
         image_index: pose
