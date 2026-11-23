@@ -134,3 +134,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+assets/target_detections.txt
+scripts/mandeye_to_cslam.py
+uv.lock
